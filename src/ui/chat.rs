@@ -137,6 +137,18 @@ fn tool_detail(input: Option<&Value>) -> String {
     String::new()
 }
 
+/// Разметку показываем как текст: в терминале `**Готово**` — это не жирный
+/// шрифт, а четыре лишних знака. Убираем только явные маркеры, содержимое
+/// строки не трогаем.
+fn plain_md(s: &str) -> String {
+    let mut out = s.replace("**", "");
+    out = out.trim_start_matches('#').trim_start().to_string();
+    if let Some(rest) = out.strip_prefix("- ") {
+        out = format!("· {rest}");
+    }
+    out
+}
+
 /// Одна запись ленты — как её видит человек.
 pub fn item_line(caps: &Caps, it: &Item) -> String {
     match it.kind {
@@ -145,11 +157,11 @@ pub fn item_line(caps: &Caps, it: &Item) -> String {
         Kind::User => {
             let head = paint(caps, Role::Accent, "› ");
             let room = (caps.width as usize).saturating_sub(2);
-            format!("{head}{}", truncate(&one_line(&it.text), room))
+            format!("{head}{}", truncate(&plain_md(&one_line(&it.text)), room))
         }
         Kind::Agent => {
             let room = (caps.width as usize).saturating_sub(2);
-            format!("  {}", truncate(&one_line(&it.text), room))
+            format!("  {}", truncate(&plain_md(&one_line(&it.text)), room))
         }
         Kind::Tool => {
             let name = paint(caps, Role::Dim, &format!("  · {}", it.text));
@@ -334,6 +346,26 @@ mod tests {
                 it.kind
             );
         }
+    }
+
+    #[test]
+    fn markdown_markers_do_not_leak_into_the_feed() {
+        let c = caps();
+        let line = item_line(
+            &c,
+            &Item {
+                kind: Kind::Agent,
+                text: "**Готово.** Тесты зелёные".into(),
+                detail: String::new(),
+            },
+        );
+        assert!(line.contains("Готово."), "{line}");
+        assert!(
+            !line.contains("**"),
+            "звёздочки — не оформление, а мусор: {line}"
+        );
+        assert_eq!(plain_md("## Заголовок"), "Заголовок");
+        assert_eq!(plain_md("- пункт"), "· пункт");
     }
 
     #[test]
