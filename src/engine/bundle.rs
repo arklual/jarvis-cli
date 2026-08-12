@@ -167,9 +167,156 @@ pub async fn merge(
     Ok(())
 }
 
+/* ---------- новая рука ---------- */
+
+/// Имя руки из задачи, если человек не назвал сам: первые осмысленные слова.
+pub fn hand_name(task: &str) -> String {
+    let joined = task
+        .split_whitespace()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ");
+    crate::core::util::ellipsize(&joined, 24)
+}
+
+/// Слаг, не занятый другой рукой связки: ветки не должны сталкиваться.
+pub fn unique_slug(b: &Bundle, name: &str) -> String {
+    let taken: Vec<String> = b
+        .hands
+        .iter()
+        .map(|h| h.branch.trim_start_matches("team/").to_string())
+        .collect();
+    let base = crate::engine::builder::slug(name);
+    if !taken.contains(&base) {
+        return base;
+    }
+    (2..99)
+        .map(|n| format!("{base}-{n}"))
+        .find(|c| !taken.contains(c))
+        .unwrap_or_else(|| format!("{base}-{}", now_ms() % 1000))
+}
+
+/// Родительский каталог: worktree живёт соседом проекта, а не в недрах
+/// `~/.jarvis` — человек в него заглядывает и правит руками.
+fn parent_of(dir: &str) -> String {
+    let d = dir.trim_end_matches('/');
+    match d.rsplit_once('/') {
+        Some(("", _)) => "/".to_string(),
+        Some((head, _)) => head.to_string(),
+        None => ".".to_string(),
+    }
+}
+
+/// Завести руку и поднять её агента: worktree, сессия, задача.
+pub async fn add_hand(
+    app: &App,
+    mut all: Vec<Bundle>,
+    idx: usize,
+    task: &str,
+) -> Result<(), String> {
+    let b = all[idx].clone();
+    let m = host_for(&b)?;
+    let base = if b.base.trim().is_empty() {
+        "main"
+    } else {
+        b.base.trim()
+    };
+    let name = hand_name(task);
+    let slug = unique_slug(&b, &name);
+    let branch = format!("team/{slug}");
+    let wt = format!("{}/wt-{slug}", parent_of(&b.dir));
+
+    let (code, out) = git(&m, &b.dir, &["worktree", "add", "-b", &branch, &wt, base]).await;
+    if code != 0 {
+        return Err(format!(
+            "не завёл worktree: {}",
+            crate::core::util::one_line(&out)
+        ));
+    }
+
+    // Задача плюс правила руки. Про коммиты говорим прямо: очередь слияний
+    // видит только закоммиченное, и рука без коммитов не станет готовой
+    // никогда — сколько бы работы она ни сделала.
+    let brief = format!(
+        "{task}\n\nТы — рука связки «{name}» в отдельном worktree ({wt}), ветка {branch}. \
+         Работай только в этом каталоге. Закончив, закоммить всё осмысленными коммитами — \
+         несделанный коммит для очереди слияний не существует. Проверки перед готовностью: {gates}.",
+        task = task.trim(),
+        name = b.name,
+        gates = if b.gates.is_empty() {
+            "нет".to_string()
+        } else {
+            b.gates
+                .iter()
+                .map(|g| g.command.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        },
+    );
+
+    let (client, _tunnel) = machine::connect(&m).await?;
+    let pane = client
+        .launch(&wt, "claude --dangerously-skip-permissions", &slug)
+        .await
+        .map_err(|e| format!("worktree готов, но агент не поднялся: {e}"))?;
+    client
+        .reply(&pane, &brief)
+        .await
+        .map_err(|e| format!("агент поднялся, но задача не доехала: {e}"))?;
+
+    all[idx].hands.push(crate::core::state::Hand {
+        id: format!("hand-{}", now_ms()),
+        name: name.clone(),
+        task: task.trim().to_string(),
+        branch: branch.clone(),
+        worktree: wt.clone(),
+        pane,
+        state: HandState::Working,
+        ..Default::default()
+    });
+    all[idx].event(format!("{name}: рука запущена · {branch}"));
+    state::save_bundles(&all).map_err(|e| format!("не записал состояние: {e}"))?;
+
+    app.say(paint(
+        &app.caps,
+        Role::Accent,
+        &format!("рука «{name}» работает · {branch}"),
+    ));
+    app.dim(&format!("worktree {wt}"));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hand_name_comes_from_the_task() {
+        assert_eq!(
+            hand_name("починить флаки в очереди слияний"),
+            "починить флаки в"
+        );
+        assert_eq!(hand_name(""), "");
+    }
+
+    /// Две руки с похожими задачами не должны драться за одну ветку.
+    #[test]
+    fn slugs_do_not_collide_inside_a_bundle() {
+        let mut b = Bundle::default();
+        b.hands.push(crate::core::state::Hand {
+            branch: "team/починить-флаки".into(),
+            ..Default::default()
+        });
+        assert_eq!(unique_slug(&b, "починить флаки"), "починить-флаки-2");
+        assert_eq!(unique_slug(&b, "другая работа"), "другая-работа");
+    }
+
+    #[test]
+    fn worktree_lives_next_to_the_project() {
+        assert_eq!(parent_of("/srv/proj"), "/srv");
+        assert_eq!(parent_of("/srv/proj/"), "/srv");
+        assert_eq!(parent_of("/proj"), "/", "корень — тоже родитель");
+    }
     use crate::core::state::Hand;
 
     fn hand(id: &str, name: &str, st: HandState, ready: i64, gates: bool) -> Hand {

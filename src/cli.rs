@@ -69,6 +69,9 @@ pub enum Cmd {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoopAction {
     Ls,
+    New,
+    Presets,
+    Rm { id: String },
     Show { id: String },
     Start { id: String },
     Stop { id: String },
@@ -77,6 +80,8 @@ pub enum LoopAction {
 #[derive(Debug, Clone, PartialEq)]
 pub enum BundleAction {
     Ls,
+    New,
+    Hand { id: String, task: String },
     Show { id: String },
     Merge { id: String, hand: String },
     Pause { id: String, on: bool },
@@ -107,13 +112,18 @@ jarvis — агенты, циклы и связка прямо в термина
   jarvis run <каталог>       поднять агента в каталоге
   jarvis limits              лимиты аккаунта
 
+  jarvis loop new            завести цикл — с каталогом заготовок
   jarvis loop ls             циклы: рутина, которую агент крутит сам
   jarvis loop show <id>      журнал итераций цикла
   jarvis loop start <id>     запустить цикл
   jarvis loop stop <id>      остановить цикл
+  jarvis loop presets        каталог заготовок: источники задач и гейты
+  jarvis loop rm <id>        убрать цикл
 
+  jarvis bundle new          завести связку
   jarvis bundle ls           связки: несколько агентов над одним проектом
   jarvis bundle show <id>    пульт связки: руки, очередь слияний
+  jarvis bundle hand <id> <задача>  добавить руку и поднять её агента
   jarvis bundle merge <id> <рука>   влить голову очереди
   jarvis bundle pause <id>   пауза всем рукам
 
@@ -248,12 +258,15 @@ fn parse_loop(rest: &[String]) -> Result<Cmd, String> {
     };
     let action = match sub {
         "ls" | "list" => LoopAction::Ls,
+        "new" | "создать" => LoopAction::New,
+        "presets" | "заготовки" => LoopAction::Presets,
+        "rm" | "remove" | "delete" => LoopAction::Rm { id: id()? },
         "show" => LoopAction::Show { id: id()? },
         "start" | "run" => LoopAction::Start { id: id()? },
         "stop" => LoopAction::Stop { id: id()? },
         other => {
             return Err(format!(
-                "не знаю «loop {other}»: есть ls, show, start, stop"
+                "не знаю «loop {other}»: есть new, ls, show, start, stop, presets, rm"
             ))
         }
     };
@@ -269,6 +282,15 @@ fn parse_bundle(rest: &[String]) -> Result<Cmd, String> {
     };
     let action = match sub {
         "ls" | "list" => BundleAction::Ls,
+        "new" | "создать" => BundleAction::New,
+        "hand" | "рука" => {
+            let id = id()?;
+            let task = rest[3..].join(" ");
+            if task.trim().is_empty() {
+                return Err("чем займётся рука? jarvis bundle hand <связка> <задача>".into());
+            }
+            BundleAction::Hand { id, task }
+        }
         "show" => BundleAction::Show { id: id()? },
         "merge" => BundleAction::Merge {
             id: id()?,
@@ -283,7 +305,7 @@ fn parse_bundle(rest: &[String]) -> Result<Cmd, String> {
         },
         other => {
             return Err(format!(
-                "не знаю «bundle {other}»: есть ls, show, merge, pause"
+                "не знаю «bundle {other}»: есть new, ls, show, hand, merge, pause"
             ))
         }
     };
@@ -426,6 +448,35 @@ mod tests {
         ] {
             assert!(HELP.contains(word), "справка молчит про {word}");
         }
+    }
+
+    #[test]
+    fn builders_have_their_own_words() {
+        assert_eq!(
+            p(&["loop", "new"]).unwrap().cmd,
+            Cmd::Loop {
+                action: LoopAction::New
+            }
+        );
+        assert_eq!(
+            p(&["bundle", "new"]).unwrap().cmd,
+            Cmd::Bundle {
+                action: BundleAction::New
+            }
+        );
+        assert_eq!(
+            p(&["bundle", "hand", "b1", "починить", "флаки"])
+                .unwrap()
+                .cmd,
+            Cmd::Bundle {
+                action: BundleAction::Hand {
+                    id: "b1".into(),
+                    task: "починить флаки".into()
+                }
+            }
+        );
+        // Рука без задачи — пустая сессия, которой никто не скажет, что делать.
+        assert!(p(&["bundle", "hand", "b1"]).is_err());
     }
 
     #[test]

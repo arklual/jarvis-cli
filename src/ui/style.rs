@@ -59,10 +59,13 @@ fn term_width() -> u16 {
             }
         }
     }
-    crossterm::terminal::size()
-        .map(|(w, _)| w)
-        .unwrap_or(80)
-        .max(20)
+    // Ноль — это не «терминал шириной ноль», а «спросить не у кого»: так
+    // отвечает pty без размера (cron, script, docker exec -T). Восемьдесят
+    // здесь — не догадка, а общее умолчание, с которым вывод остаётся читаемым.
+    match crossterm::terminal::size().map(|(w, _)| w) {
+        Ok(0) | Err(_) => 80,
+        Ok(w) => w.max(20),
+    }
 }
 
 /// Роль текста. Ролей мало намеренно: каждая новая роль — это ещё один способ
@@ -219,6 +222,19 @@ pub fn rule(caps: &Caps, title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ширина, о которой не удалось спросить, не должна превращаться в верстку
+    /// в двадцать колонок: подсказки от неё остаются от слова «под…».
+    #[test]
+    fn unknown_width_falls_back_to_eighty() {
+        assert!(term_width() >= 20);
+        let narrow = Caps {
+            color: false,
+            unicode: true,
+            width: term_width(),
+        };
+        assert!(width(&rule(&narrow, "Заголовок")) <= narrow.width as usize);
+    }
 
     fn caps(color: bool, unicode: bool) -> Caps {
         Caps {

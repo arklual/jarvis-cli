@@ -6,6 +6,8 @@ use crate::core::node::NodeClient;
 use crate::core::session::{self, Session};
 use crate::core::state;
 use crate::core::util::{clock, ellipsize, now_ms};
+use crate::engine::{self, builder, presets};
+use crate::ui::prompt;
 use crate::ui::render::{self, Window};
 use crate::ui::style::{paint, rule, Caps, Role};
 use std::collections::HashMap;
@@ -129,7 +131,7 @@ pub async fn run(parsed: Parsed) -> Result<(), String> {
         Cmd::Run { dir, agent } => cmd_run(&app, &parsed.machine, &dir, &agent).await,
         Cmd::Limits { fresh } => cmd_limits(&app, &parsed.machine, fresh).await,
         Cmd::Loop { action } => cmd_loop(&app, action).await,
-        Cmd::Bundle { action } => cmd_bundle(&app, action).await,
+        Cmd::Bundle { action } => cmd_bundle(&app, &parsed.machine, action).await,
         Cmd::Notify { once } => crate::ui::watch::notify(&app, &parsed.machine, once).await,
     }
 }
@@ -503,6 +505,71 @@ fn find_loop(id: &str) -> Result<state::Loop, String> {
 
 async fn cmd_loop(app: &App, action: LoopAction) -> Result<(), String> {
     match action {
+        LoopAction::New => {
+            if !prompt::interactive() {
+                return Err("конструктор спрашивает — запусти его в терминале, не в пайпе".into());
+            }
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| ".".into());
+            let l = builder::new_loop(&app.caps, &cwd)?;
+            println!();
+            for line in builder::summary(&app.caps, &l) {
+                app.say(line);
+            }
+            // Дыры показываем ДО согласия: «завёл и не работает» — худший
+            // исход конструктора, ради которого его и делали.
+            let problems = l.problems();
+            if !problems.is_empty() {
+                println!();
+                for p in &problems {
+                    app.say(paint(&app.caps, Role::Bad, &format!("× {p}")));
+                }
+            }
+            println!();
+            if !prompt::yes(&app.caps, "Завести", problems.is_empty())? {
+                app.dim("не завожу");
+                return Ok(());
+            }
+            let mut all = state::load_loops();
+            all.push(l.clone());
+            state::save_loops(&all).map_err(|e| format!("не записал циклы: {e}"))?;
+            app.say(paint(
+                &app.caps,
+                Role::Accent,
+                &format!("цикл «{}» заведён", l.name),
+            ));
+            app.dim(&format!(
+                "запустить: jarvis loop start {} · он же виден в панели",
+                l.name
+            ));
+            Ok(())
+        }
+        LoopAction::Presets => {
+            let src = builder::catalog(presets::Slot::Source);
+            let gates = builder::catalog(presets::Slot::Gate);
+            if app.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&presets::all()).unwrap_or_default()
+                );
+                return Ok(());
+            }
+            prompt::list(&app.caps, "Источники задач", &builder::choices(&src));
+            println!();
+            prompt::list(&app.caps, "Гейты", &builder::choices(&gates));
+            println!();
+            app.dim("выбираются в конструкторе: jarvis loop new");
+            Ok(())
+        }
+        LoopAction::Rm { id } => {
+            let l = find_loop(&id)?;
+            let mut all = state::load_loops();
+            all.retain(|x| x.id != l.id);
+            state::save_loops(&all).map_err(|e| format!("не записал циклы: {e}"))?;
+            app.dim(&format!("цикл «{}» убран; журнал запуска остался", l.name));
+            Ok(())
+        }
         LoopAction::Ls => {
             let all = state::load_loops();
             if all.is_empty() {
@@ -604,8 +671,34 @@ fn find_bundle(id: &str) -> Result<(Vec<state::Bundle>, usize), String> {
     Ok((all, idx))
 }
 
-async fn cmd_bundle(app: &App, action: BundleAction) -> Result<(), String> {
+async fn cmd_bundle(app: &App, machine: &str, action: BundleAction) -> Result<(), String> {
     match action {
+        BundleAction::New => {
+            if !prompt::interactive() {
+                return Err("конструктор спрашивает — запусти его в терминале, не в пайпе".into());
+            }
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| ".".into());
+            let b = builder::new_bundle(&app.caps, &cwd, machine)?;
+            let mut all = state::load_bundles();
+            all.push(b.clone());
+            state::save_bundles(&all).map_err(|e| format!("не записал связки: {e}"))?;
+            app.say(paint(
+                &app.caps,
+                Role::Accent,
+                &format!("связка «{}» заведена", b.name),
+            ));
+            app.dim(&format!(
+                "добавь руки: jarvis bundle hand {} <задача>",
+                b.name
+            ));
+            Ok(())
+        }
+        BundleAction::Hand { id, task } => {
+            let (all, i) = find_bundle(&id)?;
+            engine::bundle::add_hand(app, all, i, &task).await
+        }
         BundleAction::Ls => {
             let all = state::load_bundles();
             if all.is_empty() {

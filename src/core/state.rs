@@ -513,9 +513,12 @@ pub fn load_loops() -> Vec<Loop> {
     load_loops_at(&jarvis_dir())
 }
 
-#[cfg(test)]
 pub fn save_loops_at(root: &Path, items: &[Loop]) -> std::io::Result<()> {
     atomic_write(&loops_path(root), &serde_json::to_string_pretty(items)?)
+}
+
+pub fn save_loops(items: &[Loop]) -> std::io::Result<()> {
+    save_loops_at(&jarvis_dir(), items)
 }
 
 pub fn load_run_at(root: &Path, loop_id: &str) -> Option<Run> {
