@@ -1,0 +1,30 @@
+[package]
+name = "jarvis-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Jarvis в терминале: агенты, циклы, связка — поверх того же узлового протокола"
+license = "MIT"
+# is_multiple_of и let-else: ниже этой планки не соберётся, и лучше сказать
+# об этом сразу, чем ошибкой из середины сборки.
+rust-version = "1.87"
+
+[[bin]]
+name = "jarvis-cli"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "net", "time", "sync", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+chrono = "0.4"
+# TUI-фреймворка нет намеренно: живой экран здесь — одна перерисовываемая
+# страница, а ratatui тянет свой рантайм и виджет-модель ради того, что
+# укладывается в двести строк прямого вывода. crossterm нужен за малым:
+# размер терминала и чтение клавиш без Enter (альт-экран не берём — после
+# выхода человек должен видеть свою историю команд).
+crossterm = { version = "0.27", default-features = false, features = ["events"] }
+
+[profile.release]
+lto = true
+strip = true
