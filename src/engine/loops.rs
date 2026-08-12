@@ -462,7 +462,10 @@ pub async fn start(app: &App, l: &Loop) -> Result<(), String> {
                     app.say(paint(
                         &app.caps,
                         Role::Dim,
-                        "ответь и запусти снова: jarvis loop start <цикл>",
+                        &format!(
+                            "ответить: jarvis loop say {} <текст>, дальше loop start",
+                            l.name
+                        ),
                     ));
                     return Ok(());
                 }

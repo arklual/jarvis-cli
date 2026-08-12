@@ -47,6 +47,77 @@ pub fn list() -> Vec<Machine> {
     out
 }
 
+/// Записать машину в `settings.json`, не тронув остальное.
+///
+/// Файл общий с панелью, и в нём живут чужие ключи — от размеров окна до
+/// настроек запуска. Поэтому не «сохранить свой взгляд на настройки», а
+/// вписать одну запись в чужой документ.
+pub fn upsert_remote(settings: &Value, m: &Machine) -> Value {
+    let mut root = settings.as_object().cloned().unwrap_or_default();
+    let mut arr = root
+        .get("remotes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let entry = serde_json::json!({
+        "name": m.name,
+        "sshHost": m.ssh_host,
+        "jarvisDir": m.dir,
+    });
+    match arr
+        .iter()
+        .position(|i| i.get("name").and_then(Value::as_str) == Some(m.name.as_str()))
+    {
+        // Известную машину правим на месте: её порядок в списке — это порядок,
+        // к которому человек привык.
+        Some(i) => {
+            let mut merged = arr[i].as_object().cloned().unwrap_or_default();
+            for (k, v) in entry.as_object().unwrap() {
+                merged.insert(k.clone(), v.clone());
+            }
+            arr[i] = Value::Object(merged);
+        }
+        None => arr.push(entry),
+    }
+    root.insert("remotes".into(), Value::Array(arr));
+    Value::Object(root)
+}
+
+/// Убрать машину из настроек. Возвращает `None`, если такой там и не было.
+pub fn remove_remote(settings: &Value, name: &str) -> Option<Value> {
+    let mut root = settings.as_object().cloned().unwrap_or_default();
+    let arr = root.get("remotes").and_then(Value::as_array).cloned()?;
+    let left: Vec<Value> = arr
+        .iter()
+        .filter(|i| i.get("name").and_then(Value::as_str) != Some(name))
+        .cloned()
+        .collect();
+    if left.len() == arr.len() {
+        return None;
+    }
+    root.insert("remotes".into(), Value::Array(left));
+    Some(Value::Object(root))
+}
+
+/// Прочитать настройки целиком — чтобы потом вернуть их дополненными.
+pub fn read_settings() -> Value {
+    std::fs::read_to_string(jarvis_dir().join("settings.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .unwrap_or_else(|| Value::Object(Default::default()))
+}
+
+pub fn write_settings(v: &Value) -> Result<(), String> {
+    let path = jarvis_dir().join("settings.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let text = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("не пишется {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("не переименовать: {e}"))
+}
+
 /// Разбор ключа `remotes` — та же скупость, что в настольном: кривые записи
 /// пропускаются молча, список правится руками и обязан переживать опечатку.
 pub fn parse_remotes(settings: &Value) -> Vec<Machine> {
@@ -246,6 +317,52 @@ pub async fn run(m: &Machine, cwd: &str, cmd: &str, timeout: Duration) -> (i32, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Файл общий с панелью: чужие ключи обязаны пережить нашу правку.
+    #[test]
+    fn adding_a_machine_keeps_the_rest_of_settings() {
+        let before = serde_json::json!({
+            "launchDangerous": true,
+            "windowWidth": 1200,
+            "remotes": [{ "name": "vps", "sshHost": "old@host", "jarvisDir": "~/.jarvis" }]
+        });
+        let after = upsert_remote(
+            &before,
+            &Machine {
+                name: "vps".into(),
+                ssh_host: "me@vps".into(),
+                dir: "/srv/jarvis".into(),
+            },
+        );
+        assert_eq!(after["launchDangerous"], serde_json::json!(true));
+        assert_eq!(after["windowWidth"], serde_json::json!(1200));
+        let remotes = after["remotes"].as_array().unwrap();
+        assert_eq!(remotes.len(), 1, "правка, а не второй экземпляр");
+        assert_eq!(remotes[0]["sshHost"], serde_json::json!("me@vps"));
+        assert_eq!(remotes[0]["jarvisDir"], serde_json::json!("/srv/jarvis"));
+
+        let added = upsert_remote(
+            &after,
+            &Machine {
+                name: "mac".into(),
+                ssh_host: "me@mac".into(),
+                dir: "~/.jarvis".into(),
+            },
+        );
+        assert_eq!(added["remotes"].as_array().unwrap().len(), 2);
+        assert!(parse_remotes(&added).iter().any(|m| m.name == "mac"));
+    }
+
+    #[test]
+    fn removing_reports_whether_there_was_anything_to_remove() {
+        let s = serde_json::json!({ "remotes": [{ "name": "vps", "sshHost": "me@vps" }] });
+        let left = remove_remote(&s, "vps").expect("была — убрали");
+        assert!(left["remotes"].as_array().unwrap().is_empty());
+        assert!(
+            remove_remote(&s, "нетакой").is_none(),
+            "молчаливого успеха быть не должно"
+        );
+    }
 
     #[test]
     fn remotes_skip_broken_entries() {

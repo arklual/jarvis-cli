@@ -127,6 +127,9 @@ pub async fn run(parsed: Parsed) -> Result<(), String> {
         Cmd::Screen { session } => cmd_screen(&app, &parsed.machine, &session).await,
         Cmd::Chat { session, follow } => cmd_chat(&app, &parsed.machine, &session, follow).await,
         Cmd::Projects => cmd_projects(&app, &parsed.machine).await,
+        Cmd::Machines => cmd_machines(&app).await,
+        Cmd::MachineAdd { name, host, dir } => cmd_machine_add(&app, &name, &host, &dir),
+        Cmd::MachineRm { name } => cmd_machine_rm(&app, &name),
         Cmd::Control { session, cmd } => cmd_control(&app, &parsed.machine, &session, &cmd).await,
         Cmd::Run { dir, agent } => cmd_run(&app, &parsed.machine, &dir, &agent).await,
         Cmd::Limits { fresh } => cmd_limits(&app, &parsed.machine, fresh).await,
@@ -245,6 +248,82 @@ async fn cmd_screen(app: &App, machine_name: &str, needle: &str) -> Result<(), S
     let screen = client.screen(pane_of(s)?).await?;
     app.say(rule(&app.caps, &s.title()));
     println!("{}", screen.trim_end());
+    Ok(())
+}
+
+/// Машины и связь с ними: спрашиваем каждую и говорим, что ответила.
+async fn cmd_machines(app: &App) -> Result<(), String> {
+    let all = machine::list();
+    let col = all
+        .iter()
+        .map(|m| crate::ui::style::width(&m.name))
+        .max()
+        .unwrap_or(8)
+        .clamp(6, 20);
+    app.say(rule(&app.caps, "Машины"));
+    for m in &all {
+        // Проверяем связью, а не наличием строки в файле: «настроена» и
+        // «отвечает» — разные вещи, и человеку важна вторая.
+        let (word, role) = match machine::connect(m).await {
+            Ok((client, _t)) => match client.hello().await {
+                Ok(h) => {
+                    // Считаем сессии по реестру: в hello есть только длина
+                    // буфера событий, а «2000 сессий» — красивая неправда.
+                    let n = registry(&client).await.map(|r| r.len()).unwrap_or(0);
+                    (
+                        format!(
+                            "узел {} · {}",
+                            h.version,
+                            crate::core::util::plural(n as u64, "сессия", "сессии", "сессий")
+                        ),
+                        Role::Dim,
+                    )
+                }
+                Err(e) => (format!("сокет есть, узел молчит: {e}"), Role::Bad),
+            },
+            Err(e) => (e, Role::Bad),
+        };
+        app.say(format!(
+            "{} {}  {}",
+            crate::ui::style::pad(&m.name, col),
+            paint(
+                &app.caps,
+                Role::Dim,
+                &crate::ui::style::pad(&m.ssh_host, 22)
+            ),
+            paint(&app.caps, role, &word)
+        ));
+    }
+    Ok(())
+}
+
+fn cmd_machine_add(app: &App, name: &str, host: &str, dir: &str) -> Result<(), String> {
+    if name == "local" {
+        return Err("«local» — это машина, на которой ты сейчас; переименовывать её некуда".into());
+    }
+    let m = Machine {
+        name: name.to_string(),
+        ssh_host: host.to_string(),
+        dir: dir.trim_end_matches('/').to_string(),
+    };
+    let next = machine::upsert_remote(&machine::read_settings(), &m);
+    machine::write_settings(&next)?;
+    app.say(paint(
+        &app.caps,
+        Role::Accent,
+        &format!("машина «{name}» записана"),
+    ));
+    app.dim(&format!(
+        "проверить: jarvis -m {name} ls · ключ должен пускать без пароля (BatchMode)"
+    ));
+    Ok(())
+}
+
+fn cmd_machine_rm(app: &App, name: &str) -> Result<(), String> {
+    let next = machine::remove_remote(&machine::read_settings(), name)
+        .ok_or_else(|| format!("машины «{name}» в настройках и не было"))?;
+    machine::write_settings(&next)?;
+    app.dim(&format!("машина «{name}» убрана"));
     Ok(())
 }
 
@@ -560,6 +639,25 @@ async fn cmd_loop(app: &App, action: LoopAction) -> Result<(), String> {
             prompt::list(&app.caps, "Гейты", &builder::choices(&gates));
             println!();
             app.dim("выбираются в конструкторе: jarvis loop new");
+            Ok(())
+        }
+        LoopAction::Say { id, text } => {
+            let l = find_loop(&id)?;
+            let mut run =
+                state::load_run(&l.id).ok_or("цикл ещё не запускался — отвечать не на что")?;
+            // Реплика едет в следующую итерацию целиком: это ответ на вопрос,
+            // а вопрос был задан не для галочки.
+            run.interventions.push(text.clone());
+            let asked = run.ask.take().map(|a| a.question);
+            if run.state == state::RunState::Asking {
+                run.state = state::RunState::Idle;
+            }
+            state::save_run(&run).map_err(|e| format!("не записал запуск: {e}"))?;
+            match asked {
+                Some(q) => app.dim(&format!("ответ принят на «{}»", ellipsize(&q, 60))),
+                None => app.dim("цикл ни о чём не спрашивал — скажу это на следующей итерации"),
+            }
+            app.dim(&format!("продолжить: jarvis loop start {}", l.name));
             Ok(())
         }
         LoopAction::Rm { id } => {

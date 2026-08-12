@@ -36,6 +36,16 @@ pub enum Cmd {
     },
     /// Проекты машины: где на ней работали.
     Projects,
+    /// Машины: список, добавить, убрать.
+    Machines,
+    MachineAdd {
+        name: String,
+        host: String,
+        dir: String,
+    },
+    MachineRm {
+        name: String,
+    },
     /// Слэш-команда пульта в сессию: `jarvis cmd <сессия> /model opus`.
     Control {
         session: String,
@@ -71,10 +81,23 @@ pub enum LoopAction {
     Ls,
     New,
     Presets,
-    Rm { id: String },
-    Show { id: String },
-    Start { id: String },
-    Stop { id: String },
+    Rm {
+        id: String,
+    },
+    /// Реплика человека циклу: снимает вопрос и уходит в следующую итерацию.
+    Say {
+        id: String,
+        text: String,
+    },
+    Show {
+        id: String,
+    },
+    Start {
+        id: String,
+    },
+    Stop {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -109,6 +132,9 @@ jarvis — агенты, циклы и связка прямо в термина
   jarvis chat <id> [-f]      лента чата; -f — следить вживую
   jarvis projects            проекты машины
   jarvis cmd <id> /model …   слэш-команда пульта в сессию
+  jarvis machines            машины и связь с ними
+  jarvis machine add <имя> <user@host>   добавить машину
+  jarvis machine rm <имя>    убрать машину
   jarvis run <каталог>       поднять агента в каталоге
   jarvis limits              лимиты аккаунта
 
@@ -117,6 +143,7 @@ jarvis — агенты, циклы и связка прямо в термина
   jarvis loop show <id>      журнал итераций цикла
   jarvis loop start <id>     запустить цикл
   jarvis loop stop <id>      остановить цикл
+  jarvis loop say <id> <текст>  ответить циклу на его вопрос
   jarvis loop presets        каталог заготовок: источники задач и гейты
   jarvis loop rm <id>        убрать цикл
 
@@ -213,6 +240,27 @@ fn parse_cmd(rest: &[String]) -> Result<Cmd, String> {
             follow: rest.iter().any(|a| a == "-f" || a == "--follow"),
         }),
         "projects" | "proj" => Ok(Cmd::Projects),
+        "machines" | "машины" => Ok(Cmd::Machines),
+        "machine" => {
+            let sub = rest.get(1).map(String::as_str).unwrap_or("");
+            match sub {
+                "add" => {
+                    let name =
+                        arg(2).ok_or("как назвать машину? jarvis machine add <имя> <ssh-хост>")?;
+                    let host = arg(3).ok_or("куда ходить? jarvis machine add <имя> user@host")?;
+                    let dir = rest
+                        .iter()
+                        .position(|a| a == "--dir")
+                        .and_then(|i| rest.get(i + 1).cloned())
+                        .unwrap_or_else(|| "~/.jarvis".into());
+                    Ok(Cmd::MachineAdd { name, host, dir })
+                }
+                "rm" | "remove" | "delete" => Ok(Cmd::MachineRm {
+                    name: arg(2).ok_or("какую машину убрать? jarvis machine rm <имя>")?,
+                }),
+                _ => Err("есть machine add и machine rm; список — jarvis machines".into()),
+            }
+        }
         "cmd" | "slash" => {
             let session = arg(1).ok_or("кому команду? jarvis cmd <сессия> /model opus")?;
             let cmd = rest[2..].join(" ");
@@ -261,12 +309,20 @@ fn parse_loop(rest: &[String]) -> Result<Cmd, String> {
         "new" | "создать" => LoopAction::New,
         "presets" | "заготовки" => LoopAction::Presets,
         "rm" | "remove" | "delete" => LoopAction::Rm { id: id()? },
+        "say" | "answer" | "ответ" => {
+            let id = id()?;
+            let text = rest[3..].join(" ");
+            if text.trim().is_empty() {
+                return Err("что сказать циклу? jarvis loop say <цикл> <текст>".into());
+            }
+            LoopAction::Say { id, text }
+        }
         "show" => LoopAction::Show { id: id()? },
         "start" | "run" => LoopAction::Start { id: id()? },
         "stop" => LoopAction::Stop { id: id()? },
         other => {
             return Err(format!(
-                "не знаю «loop {other}»: есть new, ls, show, start, stop, presets, rm"
+                "не знаю «loop {other}»: есть new, ls, show, start, stop, say, presets, rm"
             ))
         }
     };
@@ -448,6 +504,47 @@ mod tests {
         ] {
             assert!(HELP.contains(word), "справка молчит про {word}");
         }
+    }
+
+    #[test]
+    fn machines_are_managed_from_here_too() {
+        assert_eq!(p(&["machines"]).unwrap().cmd, Cmd::Machines);
+        assert_eq!(
+            p(&["machine", "add", "vps", "me@vps", "--dir", "/srv/jarvis"])
+                .unwrap()
+                .cmd,
+            Cmd::MachineAdd {
+                name: "vps".into(),
+                host: "me@vps".into(),
+                dir: "/srv/jarvis".into()
+            }
+        );
+        // Без каталога — общее умолчание узла, а не пустая строка.
+        assert_eq!(
+            p(&["machine", "add", "vps", "me@vps"]).unwrap().cmd,
+            Cmd::MachineAdd {
+                name: "vps".into(),
+                host: "me@vps".into(),
+                dir: "~/.jarvis".into()
+            }
+        );
+        assert!(p(&["machine", "add", "vps"]).is_err());
+    }
+
+    /// Вопрос цикла без способа ответить — тупик: подсказка обещает команду,
+    /// которая обязана существовать.
+    #[test]
+    fn loop_can_be_answered() {
+        assert_eq!(
+            p(&["loop", "say", "l1", "да,", "снимай"]).unwrap().cmd,
+            Cmd::Loop {
+                action: LoopAction::Say {
+                    id: "l1".into(),
+                    text: "да, снимай".into()
+                }
+            }
+        );
+        assert!(p(&["loop", "say", "l1"]).is_err());
     }
 
     #[test]

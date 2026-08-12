@@ -6,7 +6,7 @@
 
 use crate::core::session::{Session, Status, Tally};
 use crate::core::state::{Bundle, HandState, Iteration, Loop, Run, Verdict};
-use crate::core::util::{clock, ellipsize, when};
+use crate::core::util::{clock, ellipsize, plural, when};
 use crate::ui::style::{dot, meter, pad, paint, truncate, width, Caps, Role};
 
 /// Строка сессии: значок, проект, что происходит, время.
@@ -63,17 +63,28 @@ pub fn tally_line(caps: &Caps, t: &Tally) -> String {
         parts.push(paint(
             caps,
             Role::Accent,
-            &format!("{} ждёт ответа", t.waiting),
+            &format!(
+                "{} ответа",
+                plural(t.waiting as u64, "ждёт", "ждут", "ждут")
+            ),
         ));
     }
     if t.stuck > 0 {
-        parts.push(paint(caps, Role::Bad, &format!("{} встало", t.stuck)));
+        parts.push(paint(
+            caps,
+            Role::Bad,
+            &plural(t.stuck as u64, "встало", "встали", "встали"),
+        ));
     }
     if t.working > 0 {
         parts.push(paint(caps, Role::Plain, &format!("{} в работе", t.working)));
     }
     if t.done > 0 {
-        parts.push(paint(caps, Role::Dim, &format!("{} закончило", t.done)));
+        parts.push(paint(
+            caps,
+            Role::Dim,
+            &plural(t.done as u64, "закончило", "закончили", "закончили"),
+        ));
     }
     if parts.is_empty() {
         return paint(caps, Role::Dim, "тихо");
@@ -332,8 +343,17 @@ mod tests {
             stuck: 1,
         };
         let line = tally_line(&c, &t);
-        assert!(line.starts_with("2 ждёт ответа"), "{line}");
+        // Числительное согласовано: «2 ждёт» выдаёт наспех собранную строку.
+        assert!(line.starts_with("2 ждут ответа"), "{line}");
         assert!(line.contains("1 встало") && line.contains("1 в работе"));
+        let one = tally_line(
+            &c,
+            &Tally {
+                waiting: 1,
+                ..Default::default()
+            },
+        );
+        assert!(one.starts_with("1 ждёт ответа"), "{one}");
     }
 
     #[test]
