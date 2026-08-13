@@ -27,7 +27,8 @@ pub fn all() -> &'static [Command] {
     &ALL
 }
 
-static ALL: [Command; 15] = [
+static ALL: [Command; 16] = [
+    c("new", "", "завести связку"),
     c("chat", "<проект>", "открыть чат сессии"),
     c("screen", "", "экран сессии как есть"),
     c("stop", "", "прервать агента"),

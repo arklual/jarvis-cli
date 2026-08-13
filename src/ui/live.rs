@@ -23,6 +23,7 @@ use crate::core::state;
 use crate::core::util::now_ms;
 use crate::ui::chat::{self, Feed, Item};
 use crate::ui::editor::Editor;
+use crate::ui::form::Form;
 use crate::ui::render::{self, Window};
 use crate::ui::slash;
 use crate::ui::style::{band, header, key, pad, paint, truncate, width, Bg, Caps, Role};
@@ -54,6 +55,8 @@ enum Typing {
     Task,
     /// Команда окна: строка начинается со слэша.
     Command,
+    /// Ответ на вопрос формы (заведение связки).
+    Field,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -231,6 +234,11 @@ struct Ui {
     bsel: usize,
     hsel: usize,
     open_bundle: String,
+    /// Где мы работаем: связка заводится на этой же машине, руки поднимутся
+    /// там же, где за ними смотрят.
+    machine: String,
+    /// Заводим связку: форма спрашивает по одному вопросу.
+    form: Option<Form>,
     /// Долгое действие уже идёт. Второе нажатие «влить» подряд — это два
     /// слияния, а очередь такого не прощает.
     busy: Option<String>,
@@ -262,6 +270,8 @@ impl Default for Ui {
             bsel: 0,
             hsel: 0,
             open_bundle: String::new(),
+            machine: "local".into(),
+            form: None,
             busy: None,
         }
     }
@@ -287,6 +297,7 @@ pub async fn run(app: &App, machine_name: &str) -> Result<(), String> {
     // честно показывает «связок пока нет» при полном файле связок, а нажатая в
     // этот момент клавиша разговаривает с пустотой.
     let mut ui = Ui {
+        machine: m.name.clone(),
         bundles: state::load_bundles(),
         loops: state::load_loops(),
         disk_at: now_ms(),
@@ -418,6 +429,17 @@ fn toggle_pause(id: &str, on: bool) -> Result<(), String> {
     state::save_bundles(&all).map_err(|e| format!("не записал состояние: {e}"))
 }
 
+/// Завести связку: спрашиваем по одному вопросу в той же строке ввода.
+fn start_form(ui: &mut Ui) {
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| ".".into());
+    ui.form = Some(Form::new(&cwd));
+    ui.typing = Typing::Field;
+    ui.input.clear();
+    ui.status.clear();
+}
+
 /// След нажатий в файл — по просьбе `JARVIS_KEYLOG`.
 ///
 /// «Клавиша не работает» — жалоба, которую без записи не проверить: терминалы
@@ -492,6 +514,12 @@ async fn handle(
         Act::Quit => return false,
         // Отмена набора — отдельный шаг: Esc в наборе не должен ещё и
         // выбрасывать из вида, где человек стоит.
+        Act::Escape if ui.typing == Typing::Field => {
+            ui.form = None;
+            ui.input.clear();
+            ui.typing = Typing::None;
+            ui.status = "не завожу".into();
+        }
         Act::Escape if matches!(ui.typing, Typing::Command | Typing::Task) => {
             ui.input.clear();
             ui.typing = idle_typing(ui);
@@ -645,6 +673,44 @@ async fn handle(
                 _ => ui.status = "сессия не в tmux — вариант не отправить".into(),
             }
         }
+        Act::Send if ui.typing == Typing::Field => {
+            let answer = ui.input.text().to_string();
+            let Some(form) = ui.form.as_mut() else {
+                ui.typing = Typing::None;
+                return true;
+            };
+            if !form.accept(&answer) {
+                // Либо следующий вопрос, либо тот же — когда ответ не понят.
+                ui.input.clear();
+                ui.status.clear();
+                return true;
+            }
+            let form = ui.form.take().unwrap();
+            ui.input.clear();
+            ui.typing = Typing::None;
+            let problems = form.problems();
+            if !problems.is_empty() {
+                ui.status = problems.join(" · ");
+                return true;
+            }
+            let b = form.build(&ui.machine);
+            let mut all = state::load_bundles();
+            all.push(b.clone());
+            match state::save_bundles(&all) {
+                Ok(_) => {
+                    ui.bundles = all;
+                    ui.disk_at = now_ms();
+                    // Сразу в пульт новой связки: следующий шаг — завести руку,
+                    // и он должен быть под рукой, а не через два экрана.
+                    ui.open_bundle = b.id.clone();
+                    ui.bsel = ui.bundles.len().saturating_sub(1);
+                    ui.hsel = 0;
+                    ui.view = View::Bundle;
+                    ui.status = format!("связка «{}» заведена · n — первая рука", b.name);
+                }
+                Err(e) => ui.status = format!("не записал связки: {e}"),
+            }
+        }
         Act::Send if ui.typing == Typing::Task => {
             let task = ui.input.text().trim().to_string();
             if task.is_empty() {
@@ -787,8 +853,12 @@ async fn handle(
                 Err(e) => ui.status = e,
             }
         }
+        Act::NewHand if ui.view == View::Bundles => {
+            start_form(ui);
+        }
         Act::NewHand => {
             if ui.view != View::Bundle {
+                ui.status = "новая связка — в списке связок (b), новая рука — в пульте".into();
                 return true;
             }
             if ui.busy.is_some() {
@@ -862,6 +932,12 @@ async fn run_slash(
         }
         "loops" | "loop" => ui.view = View::Loops,
         "bundles" | "bundle" => ui.view = View::Bundles,
+        "new" => {
+            // Форма спрашивает по одному вопросу — из любого вида, не только
+            // из списка связок: `/new` человек наберёт там, где вспомнил.
+            ui.view = View::Bundles;
+            start_form(ui);
+        }
         "limits" => {
             ui.limits_at = 0; // следующий круг перечитает
             ui.status = "обновляю лимиты…".into();
@@ -1066,6 +1142,13 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
 
     // Шапка-полоса: слева — где мы, справа — сводка. Полосу видно боковым
     // зрением, и экран читается как приложение, а не как вывод команды.
+    if ui.form.is_some() {
+        push(
+            &mut out,
+            &header(caps, "Новая связка", "Esc — отменить", total),
+        );
+        push(&mut out, "");
+    }
     let (left, right) = match ui.view {
         View::List => (
             format!("Jarvis · {machine}"),
@@ -1094,8 +1177,10 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
         }
         View::Help => ("Клавиши".into(), String::new()),
     };
-    push(&mut out, &header(caps, &left, &right, total));
-    push(&mut out, "");
+    if ui.form.is_none() {
+        push(&mut out, &header(caps, &left, &right, total));
+        push(&mut out, "");
+    }
 
     // Полосы снизу: воздух, состояние, ввод (в чате) и клавиши.
     let body =
@@ -1104,21 +1189,25 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
         } else {
             5
         });
-    match ui.view {
-        View::List => draw_list(&mut out, caps, ui, list, body),
-        View::Chat => draw_chat(&mut out, caps, ui, body),
-        View::Screen => {
-            for line in ui.screen.lines().take(body) {
-                push(
-                    &mut out,
-                    &format!(" {}", truncate(line, total.saturating_sub(1))),
-                );
+    if ui.form.is_some() {
+        draw_form(&mut out, caps, ui, body);
+    } else {
+        match ui.view {
+            View::List => draw_list(&mut out, caps, ui, list, body),
+            View::Chat => draw_chat(&mut out, caps, ui, body),
+            View::Screen => {
+                for line in ui.screen.lines().take(body) {
+                    push(
+                        &mut out,
+                        &format!(" {}", truncate(line, total.saturating_sub(1))),
+                    );
+                }
             }
+            View::Loops => draw_loops(&mut out, caps, ui, body),
+            View::Bundles => draw_bundles(&mut out, caps, ui, body),
+            View::Bundle => draw_bundle(&mut out, caps, ui, body),
+            View::Help => draw_help(&mut out, caps),
         }
-        View::Loops => draw_loops(&mut out, caps, ui, body),
-        View::Bundles => draw_bundles(&mut out, caps, ui, body),
-        View::Bundle => draw_bundle(&mut out, caps, ui, body),
-        View::Help => draw_help(&mut out, caps),
     }
 
     push(&mut out, "");
@@ -1227,6 +1316,7 @@ fn with_caret(caps: &Caps, line: &str, col: usize, room: usize) -> String {
 fn keys_hint(caps: &Caps, ui: &Ui) -> String {
     let pairs: Vec<(&str, &str)> = match ui.view {
         // Набор идёт поверх любого вида, поэтому его подсказки — первыми.
+        _ if ui.typing == Typing::Field => vec![("↵", "дальше"), ("esc", "отменить")],
         _ if ui.typing == Typing::Command => {
             vec![("↵", "выполнить"), ("tab", "дополнить"), ("esc", "отмена")]
         }
@@ -1253,7 +1343,12 @@ fn keys_hint(caps: &Caps, ui: &Ui) -> String {
             ("↑↓", "прокрутка"),
             ("esc", "назад"),
         ],
-        View::Bundles => vec![("↑↓", "выбор"), ("↵", "пульт"), ("esc", "назад")],
+        View::Bundles => vec![
+            ("↑↓", "выбор"),
+            ("↵", "пульт"),
+            ("n", "новая связка"),
+            ("esc", "назад"),
+        ],
         View::Bundle => vec![
             ("↑↓", "выбор"),
             ("↵", "чат руки"),
@@ -1358,11 +1453,7 @@ fn draw_bundles(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
     if ui.bundles.is_empty() {
         push(
             out,
-            &paint(
-                caps,
-                Role::Muted,
-                " Связок пока нет. Завести: jarvis bundle new",
-            ),
+            &paint(caps, Role::Muted, " Связок пока нет. n — завести связку."),
         );
         return;
     }
@@ -1389,6 +1480,90 @@ fn draw_bundles(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
             push(out, &band(caps, Bg::Sel, &row, total));
         } else {
             push(out, &format!(" {row}"));
+        }
+    }
+}
+
+/// Форма связки: что уже отвечено, что спрашивают сейчас.
+///
+/// Отвеченное остаётся на экране: человек должен видеть, что он набрал, а не
+/// помнить. На шаге гейтов показываем каталог заготовок — те же, что в
+/// конструкторе команды, потому что команды проверок из головы не вводят.
+fn draw_form(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
+    let Some(form) = ui.form.as_ref() else { return };
+    let total = caps.width as usize;
+    push(
+        out,
+        &paint(
+            caps,
+            Role::Muted,
+            " Несколько вопросов. Enter — согласиться с тем, что в скобках.",
+        ),
+    );
+    push(out, "");
+    for (label, value) in form.filled() {
+        push(
+            out,
+            &format!(
+                " {}  {}",
+                paint(caps, Role::Dim, &pad(label, 9)),
+                paint(
+                    caps,
+                    Role::Text,
+                    &truncate(&value, total.saturating_sub(12))
+                )
+            ),
+        );
+    }
+
+    let (question, default) = form.question();
+    push(out, "");
+    push(
+        out,
+        &format!(
+            " {} {}",
+            paint(caps, Role::Accent, &format!("{question}?")),
+            paint(caps, Role::Dim, &format!("[{}]", truncate(&default, 40)))
+        ),
+    );
+
+    if form.step() == crate::ui::form::Step::Gates {
+        push(out, "");
+        let cat = crate::engine::builder::catalog(crate::engine::presets::Slot::Gate);
+        let col = cat
+            .iter()
+            .map(|p| width(p.name))
+            .max()
+            .unwrap_or(10)
+            .clamp(8, 24);
+        let mut group = "";
+        // Влезет столько, сколько осталось места: остальное человек и так
+        // наберёт номерами, а обрезанный список честнее вранья про «это всё».
+        let room = rows.saturating_sub(form.filled().len() + 6).max(3);
+        for (i, p) in cat.iter().enumerate().take(room) {
+            if p.category != group {
+                group = p.category;
+                push(out, &format!("  {}", paint(caps, Role::Dim, group)));
+            }
+            push(
+                out,
+                &format!(
+                    "  {}  {}  {}",
+                    paint(caps, Role::Accent, &format!("{:>2}", i + 1)),
+                    pad(&truncate(p.name, col), col),
+                    paint(
+                        caps,
+                        Role::Muted,
+                        &truncate(p.hint, total.saturating_sub(col + 12))
+                    )
+                ),
+            );
+        }
+        if cat.len() > room {
+            push(
+                out,
+                &paint(caps, Role::Dim, &format!("  … и ещё {}", cat.len() - room)),
+            );
         }
     }
 }
@@ -1650,6 +1825,40 @@ mod tests {
         assert_eq!(plain, "раз !два", "каретка съела букву: {plain:?}");
         // Обратным цветом помечен ровно один символ — тот, что под курсором.
         assert!(line.contains("\x1b[7mд\x1b[27m"), "{line:?}");
+    }
+
+    /// Связка должна заводиться НЕ выходя из окна: раньше пустой список
+    /// советовал команду снаружи — это и значило «в окне нельзя».
+    #[tokio::test]
+    async fn n_in_the_bundle_list_starts_the_form() {
+        let mut ui = ui_in(View::Bundles, Typing::None);
+        press(&mut ui, Act::NewHand).await;
+        assert!(ui.form.is_some(), "форма не открылась");
+        assert_eq!(ui.typing, Typing::Field);
+
+        // Ответы идут по одному: каталог, имя, база — и только потом гейты.
+        for _ in 0..3 {
+            press(&mut ui, Act::Send).await;
+        }
+        assert_eq!(
+            ui.form.as_ref().map(|f| f.step()),
+            Some(crate::ui::form::Step::Gates)
+        );
+
+        // Esc отменяет всё разом и не оставляет полуформы.
+        press(&mut ui, Act::Escape).await;
+        assert!(ui.form.is_none() && ui.typing == Typing::None);
+    }
+
+    /// То же самое командой — из любого вида.
+    #[tokio::test]
+    async fn slash_new_starts_the_form_too() {
+        let mut ui = ui_in(View::Chat, Typing::Message);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let client = NodeClient::unix("/nonexistent.sock");
+        run_slash(&mut ui, "new", "", &client, &[], &Caps::default(), &tx).await;
+        assert!(ui.form.is_some());
+        assert_eq!(ui.view, View::Bundles);
     }
 
     /// Слэш открывает командную строку из любого вида — команды `jarvis`
