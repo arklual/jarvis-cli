@@ -7,7 +7,9 @@
 use crate::core::session::{Session, Status, Tally};
 use crate::core::state::{Bundle, HandState, Iteration, Loop, Run, Verdict};
 use crate::core::util::{clock, ellipsize, plural, when};
-use crate::ui::style::{dot, meter, pad, paint, truncate, width, Caps, Role};
+use crate::ui::style::{
+    band, bold, dot, level, meter, pad, paint, truncate, width, Bg, Caps, Role,
+};
 
 /// Строка сессии: значок, проект, что происходит, время.
 ///
@@ -22,17 +24,16 @@ pub fn session_row(caps: &Caps, s: &Session, name_col: usize) -> String {
         Status::Failed | Status::Limit => "stuck",
         Status::Idle => "idle",
     };
-    let title = paint(
-        caps,
-        Role::Plain,
-        &pad(&truncate(&s.title(), name_col), name_col),
-    );
+    // Имя весом, подробность — приглушённо: в списке из десяти строк взгляд
+    // ищет проект, а не пересказ последнего хода.
+    let title = bold(caps, &pad(&truncate(&s.title(), name_col), name_col));
     let when = paint(caps, Role::Dim, &clock(s.updated_at));
     // Вопрос вытесняет подробность: он и есть причина смотреть на строку.
     let detail = match (&s.question, s.status) {
-        (Some(q), _) => paint(caps, Role::Accent, &ellipsize(q, 200)),
+        (Some(q), _) => paint(caps, Role::Warn, &ellipsize(q, 200)),
         (None, Status::Failed | Status::Limit) => paint(caps, Role::Bad, &s.detail),
-        _ => paint(caps, Role::Dim, &s.detail),
+        (None, Status::Done) => paint(caps, Role::Muted, &s.detail),
+        _ => paint(caps, Role::Muted, &s.detail),
     };
     let head = format!("{} {title} ", dot(caps, kind));
     let tail = if when.is_empty() {
@@ -62,7 +63,7 @@ pub fn tally_line(caps: &Caps, t: &Tally) -> String {
     if t.waiting > 0 {
         parts.push(paint(
             caps,
-            Role::Accent,
+            Role::Warn,
             &format!(
                 "{} ответа",
                 plural(t.waiting as u64, "ждёт", "ждут", "ждут")
@@ -77,12 +78,16 @@ pub fn tally_line(caps: &Caps, t: &Tally) -> String {
         ));
     }
     if t.working > 0 {
-        parts.push(paint(caps, Role::Plain, &format!("{} в работе", t.working)));
+        parts.push(paint(
+            caps,
+            Role::Accent,
+            &format!("{} в работе", t.working),
+        ));
     }
     if t.done > 0 {
         parts.push(paint(
             caps,
-            Role::Dim,
+            Role::Muted,
             &plural(t.done as u64, "закончило", "закончили", "закончили"),
         ));
     }
@@ -106,17 +111,29 @@ pub fn limits_line(caps: &Caps, windows: &[Window]) -> String {
         return paint(caps, Role::Dim, "лимиты недоступны");
     }
     let worst = windows.iter().max_by_key(|w| w.pct).unwrap();
+    // Каждое окно — своей краской по тому, насколько оно близко к стене; сами
+    // подписи приглушены, чтобы в глаза бросалось только число у границы.
     let mut parts: Vec<String> = windows
         .iter()
-        .map(|w| format!("{} {}%", w.label, w.pct))
+        .map(|w| {
+            format!(
+                "{} {}",
+                paint(caps, Role::Dim, &w.label),
+                paint(caps, level(w.pct), &format!("{}%", w.pct))
+            )
+        })
         .collect();
     if worst.reset_at > crate::core::util::now_ms() {
-        parts.push(format!("до {}", when(worst.reset_at)));
+        parts.push(paint(
+            caps,
+            Role::Dim,
+            &format!("до {}", when(worst.reset_at)),
+        ));
     }
     format!(
         "{} {}",
         meter(caps, worst.pct, 10),
-        paint(caps, Role::Dim, &parts.join(" · "))
+        parts.join(&paint(caps, Role::Border, " · "))
     )
 }
 
@@ -134,11 +151,7 @@ pub fn limit_row(caps: &Caps, w: &Window, label_col: usize) -> String {
         "{} {}  {}{}",
         pad(&truncate(&w.label, label_col), label_col),
         meter(caps, w.pct, 12),
-        paint(
-            caps,
-            if w.pct >= 90 { Role::Bad } else { Role::Plain },
-            &format!("{:>3}%", w.pct)
-        ),
+        paint(caps, level(w.pct), &format!("{:>3}%", w.pct)),
         paint(caps, Role::Dim, &reset)
     )
 }
@@ -208,12 +221,19 @@ pub fn iteration_row(caps: &Caps, it: &Iteration) -> String {
         String::new()
     };
     let head = format!("{:>3}  {}  ", it.n, paint(caps, role, &pad(word, 16)));
-    let room = (caps.width as usize).saturating_sub(width(&head) + width(&mark) + 8);
-    format!(
+    let room = (caps.width as usize).saturating_sub(width(&head) + width(&mark) + 10);
+    let line = format!(
         "{head}{}{mark}  {}",
         truncate(&it.summary, room.max(10)),
         paint(caps, Role::Dim, &fmt_tokens(it.tokens))
-    )
+    );
+    // Сорвавшаяся итерация — полосой: в журнале из двадцати строк её ищут
+    // глазами, и красное слово в общем ряду теряется.
+    if matches!(it.verdict, Verdict::GateFailed | Verdict::Failed) {
+        band(caps, Bg::Bad, &line, caps.width as usize)
+    } else {
+        format!(" {line}")
+    }
 }
 
 pub fn fmt_tokens(n: u64) -> String {
@@ -276,6 +296,7 @@ mod tests {
     fn limit_row_names_the_window_once() {
         let c = Caps {
             color: false,
+            truecolor: false,
             unicode: true,
             width: 80,
         };
@@ -293,6 +314,7 @@ mod tests {
     fn caps() -> Caps {
         Caps {
             color: false,
+            truecolor: false,
             unicode: true,
             width: 80,
         }

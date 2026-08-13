@@ -8,7 +8,7 @@
 use crate::app::App;
 use crate::core::node::NodeClient;
 use crate::core::util::{clock, ellipsize, one_line};
-use crate::ui::style::{paint, truncate, width, Caps, Role};
+use crate::ui::style::{band, paint, truncate, width, wrap, Bg, Caps, Role};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -149,33 +149,77 @@ fn plain_md(s: &str) -> String {
     out
 }
 
-/// Одна запись ленты — как её видит человек.
-pub fn item_line(caps: &Caps, it: &Item) -> String {
+/// Запись ленты блоком — как её видит человек.
+///
+/// Роли разведены не значком, а формой блока, и это главное, что делает ленту
+/// читаемой: реплика человека лежит на подложке во всю ширину, ответ агента —
+/// обычный текст с полем, вызов инструмента — узкая полоса другого тона. Роль
+/// узнаётся раньше, чем прочитано первое слово, и лента перестаёт быть
+/// простынёй одинаковых строк.
+///
+/// Текст переносится по словам, а не обрезается: в обрезанной реплике прячется
+/// ровно то, ради чего её читают.
+pub fn block(caps: &Caps, it: &Item, total: usize) -> Vec<String> {
+    let total = total.max(12);
     match it.kind {
-        // Роли разведены формой и отступом: «ты» прижато влево и помечено,
-        // агент — обычным текстом. Диалог должен читаться как диалог.
         Kind::User => {
-            let head = paint(caps, Role::Accent, "› ");
-            let room = (caps.width as usize).saturating_sub(2);
-            format!("{head}{}", truncate(&plain_md(&one_line(&it.text)), room))
+            // Отступ в две ячейки с каждой стороны: буквы не должны упираться
+            // в границу цвета.
+            wrap(&plain_md(&it.text), total.saturating_sub(4))
+                .into_iter()
+                .map(|l| band(caps, Bg::User, &format!(" {l}"), total))
+                .collect()
         }
-        Kind::Agent => {
-            let room = (caps.width as usize).saturating_sub(2);
-            format!("  {}", truncate(&plain_md(&one_line(&it.text)), room))
-        }
+        Kind::Agent => wrap(&plain_md(&it.text), total.saturating_sub(4))
+            .into_iter()
+            .map(|l| format!("  {}", paint(caps, Role::Text, &l)))
+            .collect(),
         Kind::Tool => {
-            let name = paint(caps, Role::Dim, &format!("  · {}", it.text));
-            if it.detail.is_empty() {
-                name
+            let mark = if caps.unicode { "⏺" } else { "*" };
+            let head = format!(
+                "{} {}",
+                paint(caps, Role::Accent, mark),
+                paint(caps, Role::Text, &it.text)
+            );
+            let room = total.saturating_sub(width(&head) + 6);
+            let line = if it.detail.is_empty() {
+                head
             } else {
-                let room = (caps.width as usize).saturating_sub(width(&name) + 3);
                 format!(
-                    "{name} {}",
-                    paint(caps, Role::Dim, &truncate(&it.detail, room.max(8)))
+                    "{head}  {}",
+                    paint(caps, Role::Muted, &truncate(&it.detail, room.max(8)))
                 )
-            }
+            };
+            vec![band(caps, Bg::Tool, &format!(" {line}"), total)]
         }
     }
+}
+
+/// Нужен ли воздух перед следующей записью.
+///
+/// Между разными голосами — пустая строка, между подряд идущими вызовами
+/// инструментов — нет: десять полос с воздухом между ними занимают весь экран,
+/// а читаются они как один поток работы.
+pub fn needs_gap(prev: Option<&Kind>, next: &Kind) -> bool {
+    match prev {
+        None => false,
+        Some(Kind::Tool) => *next != Kind::Tool,
+        Some(_) => true,
+    }
+}
+
+/// Лента целиком: блоки с воздухом там, где он нужен.
+pub fn feed_lines(caps: &Caps, items: &[Item], total: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut prev: Option<Kind> = None;
+    for it in items {
+        if needs_gap(prev.as_ref(), &it.kind) {
+            out.push(String::new());
+        }
+        out.extend(block(caps, it, total));
+        prev = Some(it.kind.clone());
+    }
+    out
 }
 
 /// Показать чат и дочитывать, пока не прервут.
@@ -276,9 +320,19 @@ pub async fn tail(
 ) -> Result<(), String> {
     app.say(crate::ui::style::rule(&app.caps, title));
     let mut feed = Feed::open(client, path).await?;
+    let mut last_kind: Option<Kind> = None;
     loop {
         for it in feed.poll(client).await? {
-            app.say(item_line(&app.caps, &it));
+            // Те же блоки, что в окне: одна лента — один вид, где бы человек
+            // её ни читал. Воздух считаем по прошлой записи, а она могла
+            // приехать в прошлой порции — потому и живёт снаружи цикла.
+            if needs_gap(last_kind.as_ref(), &it.kind) {
+                app.say(String::new());
+            }
+            for line in block(&app.caps, &it, app.caps.width as usize) {
+                app.say(line);
+            }
+            last_kind = Some(it.kind.clone());
         }
         if feed.missing && !follow {
             app.dim("транскрипта ещё нет — сессия не слала событий");
@@ -311,6 +365,7 @@ mod tests {
     fn caps() -> Caps {
         Caps {
             color: false,
+            truecolor: false,
             unicode: true,
             width: 80,
         }
@@ -364,76 +419,83 @@ mod tests {
         );
     }
 
+    /// Реплика человека и ответ агента должны различаться на глаз мгновенно:
+    /// один блок на подложке во всю ширину, другой — текст с полем.
+    /// Воздух между голосами есть, между подряд идущими инструментами — нет.
     #[test]
-    fn lines_never_exceed_the_terminal() {
-        let c = caps();
-        let long = "очень длинный текст ".repeat(30);
-        for it in [
-            Item {
-                kind: Kind::User,
-                text: long.clone(),
-                detail: String::new(),
-            },
-            Item {
-                kind: Kind::Agent,
-                text: long.clone(),
-                detail: String::new(),
-            },
-            Item {
-                kind: Kind::Tool,
-                text: "Bash".into(),
-                detail: long,
-            },
-        ] {
-            assert!(
-                width(&item_line(&c, &it)) <= c.width as usize,
-                "{:?} вылезла",
-                it.kind
-            );
-        }
-    }
-
-    #[test]
-    fn markdown_markers_do_not_leak_into_the_feed() {
-        let c = caps();
-        let line = item_line(
-            &c,
-            &Item {
-                kind: Kind::Agent,
-                text: "**Готово.** Тесты зелёные".into(),
-                detail: String::new(),
-            },
-        );
-        assert!(line.contains("Готово."), "{line}");
+    fn gaps_separate_voices_not_every_line() {
+        assert!(!needs_gap(None, &Kind::User), "перед первой записью пусто");
         assert!(
-            !line.contains("**"),
-            "звёздочки — не оформление, а мусор: {line}"
+            !needs_gap(Some(&Kind::Tool), &Kind::Tool),
+            "поток работы не рвём"
         );
-        assert_eq!(plain_md("## Заголовок"), "Заголовок");
-        assert_eq!(plain_md("- пункт"), "· пункт");
+        assert!(needs_gap(Some(&Kind::Tool), &Kind::Agent));
+        assert!(needs_gap(Some(&Kind::Agent), &Kind::User));
+        assert!(needs_gap(Some(&Kind::User), &Kind::Tool));
     }
 
     #[test]
-    fn user_and_agent_look_different() {
-        let c = caps();
-        let user = item_line(
+    fn user_block_is_a_band_and_agent_block_is_not() {
+        let c = Caps {
+            color: true,
+            truecolor: true,
+            unicode: true,
+            width: 40,
+        };
+        let user = block(
             &c,
             &Item {
                 kind: Kind::User,
-                text: "я".into(),
+                text: "сделай уже".into(),
                 detail: String::new(),
             },
+            40,
         );
-        let agent = item_line(
+        let agent = block(
             &c,
             &Item {
                 kind: Kind::Agent,
-                text: "я".into(),
+                text: "сделай уже".into(),
                 detail: String::new(),
             },
+            40,
         );
-        assert_ne!(user, agent, "голоса обязаны различаться на глаз");
-        assert!(user.starts_with('›'));
+        assert!(user[0].contains("48;2;"), "у реплики человека нет подложки");
+        assert!(!agent[0].contains("48;2;"), "ответ агента залит фоном");
+        assert_eq!(width(&user[0]), 40, "подложка не во всю ширину");
+    }
+
+    /// Длинный ответ обязан читаться целиком.
+    #[test]
+    fn long_text_wraps_instead_of_being_cut() {
+        let c = Caps {
+            color: false,
+            truecolor: false,
+            unicode: true,
+            width: 40,
+        };
+        let text = "раз два три четыре пять шесть семь восемь девять десять";
+        let lines = block(
+            &c,
+            &Item {
+                kind: Kind::Agent,
+                text: text.into(),
+                detail: String::new(),
+            },
+            30,
+        );
+        assert!(lines.len() > 1, "длинный ответ уместился в строку?");
+        assert!(lines.iter().all(|l| width(l) <= 30), "{lines:?}");
+        let joined = lines
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(joined, text, "перенос потерял слова");
+        assert!(
+            !lines.iter().any(|l| l.contains('…')),
+            "текст обрезан, а не перенесён"
+        );
     }
 
     #[test]

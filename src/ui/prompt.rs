@@ -250,6 +250,7 @@ mod tests {
     fn caps() -> Caps {
         Caps {
             color: false,
+            truecolor: false,
             unicode: true,
             width: 80,
         }

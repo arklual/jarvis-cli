@@ -23,7 +23,7 @@ use crate::core::state;
 use crate::core::util::now_ms;
 use crate::ui::chat::{self, Feed, Item};
 use crate::ui::render::{self, Window};
-use crate::ui::style::{pad, paint, rule, truncate, width, Caps, Role};
+use crate::ui::style::{band, header, key, pad, paint, truncate, width, Bg, Caps, Role};
 use crossterm::event::{poll, read, Event, KeyCode, KeyEvent, KeyModifiers};
 use std::io::Write;
 use std::time::Duration;
@@ -87,6 +87,16 @@ pub fn map_key(view_is_text: bool, k: KeyEvent) -> Act {
         return match k.code {
             KeyCode::Char('c') => Act::Quit,
             KeyCode::Char('u') => Act::KillLine,
+            // В сыром режиме перевод строки приходит как Ctrl+J, а не Enter:
+            // так его отдают часть терминалов и всё, что печатает в пану
+            // программно. Для человека это тот же Enter.
+            KeyCode::Char('j') => {
+                if view_is_text {
+                    Act::Send
+                } else {
+                    Act::Open
+                }
+            }
             _ => Act::None,
         };
     }
@@ -509,25 +519,36 @@ fn repaint(frame: &str, last: &str) -> Option<String> {
 /// Собрать кадр целиком. Чистая функция: ни печати, ни управляющих
 /// последовательностей очистки — только текст, который увидит человек.
 fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> String {
+    let total = caps.width as usize;
     let mut out = String::new();
-    let head = match ui.view {
-        View::List => format!("Jarvis · {machine}"),
-        View::Chat => format!("{} · чат", ui.open_title),
-        View::Screen => format!("{} · экран", ui.open_title),
-        View::Loops => "Циклы".into(),
-        View::Bundles => "Связки".into(),
-        View::Help => "Клавиши".into(),
-    };
-    push(&mut out, &rule(caps, &head));
 
-    // Полосы: заголовок, подвал (клавиши), строка состояния и, в чате, ввод.
-    let body = (rows as usize).saturating_sub(if ui.view == View::Chat { 5 } else { 4 });
+    // Шапка-полоса: слева — где мы, справа — сводка. Полосу видно боковым
+    // зрением, и экран читается как приложение, а не как вывод команды.
+    let (left, right) = match ui.view {
+        View::List => (
+            format!("Jarvis · {machine}"),
+            crate::ui::style::strip(&render::tally_line(caps, &session::tally(list))),
+        ),
+        View::Chat => (format!("{} · чат", ui.open_title), machine.to_string()),
+        View::Screen => (format!("{} · экран", ui.open_title), machine.to_string()),
+        View::Loops => ("Циклы".into(), machine.to_string()),
+        View::Bundles => ("Связки".into(), machine.to_string()),
+        View::Help => ("Клавиши".into(), String::new()),
+    };
+    push(&mut out, &header(caps, &left, &right, total));
+    push(&mut out, "");
+
+    // Полосы снизу: воздух, состояние, ввод (в чате) и клавиши.
+    let body = (rows as usize).saturating_sub(if ui.view == View::Chat { 6 } else { 5 });
     match ui.view {
         View::List => draw_list(&mut out, caps, ui, list, body),
         View::Chat => draw_chat(&mut out, caps, ui, body),
         View::Screen => {
             for line in ui.screen.lines().take(body) {
-                push(&mut out, &truncate(line, caps.width as usize));
+                push(
+                    &mut out,
+                    &format!(" {}", truncate(line, total.saturating_sub(1))),
+                );
             }
         }
         View::Loops => draw_loops(&mut out, caps, body),
@@ -537,24 +558,39 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
 
     push(&mut out, "");
     if ui.view == View::List {
-        push(&mut out, &render::limits_line(caps, &ui.limits));
+        push(
+            &mut out,
+            &format!(" {}", render::limits_line(caps, &ui.limits)),
+        );
     } else if !ui.status.is_empty() {
-        push(&mut out, &paint(caps, Role::Dim, &ui.status));
+        push(
+            &mut out,
+            &format!(" {}", paint(caps, Role::Muted, &ui.status)),
+        );
     } else {
         push(&mut out, "");
     }
     if ui.view == View::Chat {
-        let head = paint(caps, Role::Accent, "› ");
+        // Строка ввода — на подложке: видно, где кончается лента и начинается
+        // то, что ты печатаешь. Каретка — обратным цветом, как в pi.
+        let room = total.saturating_sub(6);
+        let typed = truncate(&ui.input, room);
+        let caret = if caps.color {
+            "\x1b[7m \x1b[27m".to_string()
+        } else {
+            "_".to_string()
+        };
         push(
             &mut out,
-            &format!(
-                "{head}{}{}",
-                truncate(&ui.input, (caps.width as usize).saturating_sub(3)),
-                paint(caps, Role::Dim, "▁")
+            &band(
+                caps,
+                Bg::Sel,
+                &format!("{} {typed}{caret}", paint(caps, Role::Accent, "›")),
+                total,
             ),
         );
     }
-    push(&mut out, &paint(caps, Role::Dim, &keys_hint(ui)));
+    push(&mut out, &format!(" {}", keys_hint(caps, ui)));
     // Хвостовой перевод строки убираем: он-то и прокручивает полный экран.
     while out.ends_with("\r\n") {
         out.truncate(out.len() - 2);
@@ -563,56 +599,89 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
 }
 
 /// Строка в конце — единственная подсказка, которую человек читает. Поэтому в
-/// ней ровно то, что работает ЗДЕСЬ, а не весь список возможностей.
-fn keys_hint(ui: &Ui) -> String {
-    match ui.view {
-        View::List => "↑↓ выбор · Enter чат · s экран · x прервать · 1-9 ответ · l циклы · b связки · ? клавиши · q выход".into(),
-        View::Chat => "печатай и Enter — ответ агенту · ↑↓ прокрутка · Esc назад".into(),
-        View::Screen | View::Loops | View::Bundles | View::Help => "Esc назад · q выход".into(),
+/// ней ровно то, что работает ЗДЕСЬ, а не весь список возможностей: клавиша
+/// выделена, объяснение приглушено, пары разделены точкой.
+fn keys_hint(caps: &Caps, ui: &Ui) -> String {
+    let pairs: Vec<(&str, &str)> = match ui.view {
+        View::List => vec![
+            ("↑↓", "выбор"),
+            ("↵", "чат"),
+            ("s", "экран"),
+            ("x", "прервать"),
+            ("1-9", "ответ"),
+            ("l", "циклы"),
+            ("b", "связки"),
+            ("?", "клавиши"),
+            ("q", "выход"),
+        ],
+        View::Chat => vec![("↵", "отправить"), ("↑↓", "прокрутка"), ("esc", "назад")],
+        View::Screen | View::Loops | View::Bundles | View::Help => {
+            vec![("esc", "назад"), ("q", "выход")]
+        }
+    };
+    let sep = paint(caps, Role::Border, " · ");
+    let room = (caps.width as usize).saturating_sub(2);
+    // В узком окне выбрасываем ПАРЫ с конца, а не режем строку: обрезанная
+    // строка оставляет висеть половину подсказки и открытую краску.
+    let mut n = pairs.len();
+    loop {
+        let line = pairs[..n]
+            .iter()
+            .map(|(k, w)| key(caps, k, w))
+            .collect::<Vec<_>>()
+            .join(&sep);
+        if n <= 1 || width(&line) <= room {
+            return line;
+        }
+        n -= 1;
     }
 }
 
 fn draw_list(out: &mut String, caps: &Caps, ui: &Ui, list: &[Session], rows: usize) {
     if list.is_empty() {
-        push(out, &paint(caps, Role::Dim, "Ни одной сессии."));
+        push(out, &paint(caps, Role::Muted, " Ни одной сессии."));
         return;
     }
+    let total = caps.width as usize;
+    // Строку строим на ширину без полей: выделенная ляжет на подложку, у
+    // которой свои поля, и обе обязаны совпасть по краю.
+    let inner = Caps {
+        width: total.saturating_sub(2) as u16,
+        ..*caps
+    };
     let col = render::name_column(list);
     let from = ui.sel.saturating_sub(rows.saturating_sub(1));
-    for (i, s) in list
-        .iter()
-        .enumerate()
-        .skip(from)
-        .take(rows.saturating_sub(2))
-    {
-        let row = render::session_row(caps, s, col);
+    for (i, s) in list.iter().enumerate().skip(from).take(rows) {
+        let row = render::session_row(&inner, s, col);
         if i == ui.sel {
-            // Выделение — стрелкой и полной строкой; цветом мы уже говорим
-            // о состоянии, и второй смысл у той же краски сбивал бы.
-            push(out, &format!("{}{}", paint(caps, Role::Accent, "▸"), row));
+            push(out, &band(caps, Bg::Sel, &row, total));
         } else {
             push(out, &format!(" {row}"));
         }
     }
-    push(out, "");
-    push(out, &render::tally_line(caps, &session::tally(list)));
 }
 
 fn draw_chat(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
     if ui.items.is_empty() {
         push(
             out,
-            &paint(caps, Role::Dim, "Пока пусто — ждём первых строк."),
+            &paint(caps, Role::Muted, " Пока пусто — ждём первых строк."),
         );
         return;
     }
-    for it in visible(&ui.items, rows, ui.scroll) {
-        push(out, &chat::item_line(caps, it));
+    // Лента собирается блоками, а потом берётся её хвост: у блока переменная
+    // высота, и считать видимое по числу записей — верный способ показать
+    // половину сообщения.
+    let total = caps.width as usize;
+    let tail = ui.items.len().saturating_sub(60);
+    let lines = chat::feed_lines(caps, &ui.items[tail..], total);
+    for l in visible(&lines, rows, ui.scroll) {
+        push(out, l);
     }
     if ui.scroll > 0 {
         push(
             out,
-            &paint(caps, Role::Dim, &format!("↑ прокручено на {}", ui.scroll)),
+            &paint(caps, Role::Dim, &format!(" ↑ прокручено на {}", ui.scroll)),
         );
     }
 }
@@ -732,6 +801,7 @@ mod tests {
     fn frame_caps() -> Caps {
         Caps {
             color: false,
+            truecolor: false,
             unicode: true,
             width: 80,
         }
@@ -793,6 +863,18 @@ mod tests {
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    /// В сыром режиме `\n` приходит как Ctrl+J. Для человека это Enter — и
+    /// окно обязано понимать его так же, иначе часть терминалов «не нажимает».
+    #[test]
+    fn ctrl_j_is_the_same_enter() {
+        let cj = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(map_key(false, cj), Act::Open);
+        assert_eq!(map_key(true, cj), Act::Send);
+        // Без Ctrl «j» остаётся навигацией по списку и буквой в чате.
+        assert_eq!(map_key(false, key('j')), Act::Down);
+        assert_eq!(map_key(true, key('j')), Act::Type('j'));
     }
 
     #[test]

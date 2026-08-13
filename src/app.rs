@@ -286,7 +286,14 @@ async fn cmd_machines(app: &App) -> Result<(), String> {
         // Причина отказа бывает длинной и с советом внутри; в строке таблицы
         // ей место только до края экрана — целиком её скажет сама команда,
         // ради которой человек сюда и пришёл.
-        let host = crate::ui::style::pad(&crate::ui::style::truncate(&m.ssh_host, 22), 22);
+        // У локальной машины ssh-адреса нет, и пустая колонка выглядит как
+        // недосказанность — говорим словами, что это за машина.
+        let addr = if m.ssh_host.trim().is_empty() {
+            "этот компьютер"
+        } else {
+            m.ssh_host.trim()
+        };
+        let host = crate::ui::style::pad(&crate::ui::style::truncate(addr, 22), 22);
         let room = (app.caps.width as usize).saturating_sub(col + 1 + width(&host) + 2);
         app.say(format!(
             "{} {}  {}",

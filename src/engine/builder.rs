@@ -114,12 +114,28 @@ pub fn summary(caps: &Caps, l: &Loop) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-/// Заготовки одного слота — в порядке показа.
+/// Заготовки одного слота — в порядке показа, разделами подряд.
+///
+/// Раздел, встреченный дважды («Rust» сверху и «Rust» через три пункта),
+/// читается как ошибка каталога: человек ищет свой язык в одном месте.
+/// Порядок самих разделов — тот, в котором они впервые встретились: он
+/// осмысленный, от частого к редкому.
 pub fn catalog(slot: Slot) -> Vec<presets::Preset> {
-    presets::all()
+    let items: Vec<presets::Preset> = presets::all()
         .into_iter()
         .filter(|p| p.slot == slot)
-        .collect()
+        .collect();
+    let mut order: Vec<&str> = Vec::new();
+    for p in &items {
+        if !order.contains(&p.category) {
+            order.push(p.category);
+        }
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for cat in order {
+        out.extend(items.iter().filter(|p| p.category == cat).cloned());
+    }
+    out
 }
 
 /// Пункты меню из заготовок: название, подсказка, раздел.
@@ -304,6 +320,7 @@ mod tests {
         let text = summary(
             &Caps {
                 color: false,
+                truecolor: false,
                 unicode: true,
                 width: 80,
             },
@@ -318,6 +335,26 @@ mod tests {
             "стены",
         ] {
             assert!(text.contains(must), "в итоге нет «{must}»:\n{text}");
+        }
+    }
+
+    /// Разделы идут подряд: один и тот же язык не должен встречаться дважды.
+    #[test]
+    fn catalog_keeps_categories_together() {
+        for slot in [Slot::Source, Slot::Gate] {
+            let mut seen: Vec<&str> = Vec::new();
+            let mut last = "";
+            for p in catalog(slot) {
+                if p.category != last {
+                    assert!(
+                        !seen.contains(&p.category),
+                        "раздел «{}» встретился второй раз",
+                        p.category
+                    );
+                    seen.push(p.category);
+                    last = p.category;
+                }
+            }
         }
     }
 
