@@ -798,6 +798,17 @@ fn find_bundle(id: &str) -> Result<(Vec<state::Bundle>, usize), String> {
     Ok((all, idx))
 }
 
+/// Отчёт движка: первая строка — итог, остальные — подробности.
+fn say_report(app: &App, report: &[String]) {
+    let mut it = report.iter();
+    if let Some(head) = it.next() {
+        app.say(paint(&app.caps, Role::Accent, head));
+    }
+    for rest in it {
+        app.dim(rest);
+    }
+}
+
 async fn cmd_bundle(app: &App, machine: &str, action: BundleAction) -> Result<(), String> {
     match action {
         BundleAction::New => {
@@ -824,7 +835,9 @@ async fn cmd_bundle(app: &App, machine: &str, action: BundleAction) -> Result<()
         }
         BundleAction::Hand { id, task } => {
             let (all, i) = find_bundle(&id)?;
-            engine::bundle::add_hand(app, all, i, &task).await
+            let report = engine::bundle::add_hand(all, i, &task).await?;
+            say_report(app, &report);
+            Ok(())
         }
         BundleAction::Ls => {
             let all = state::load_bundles();
@@ -892,7 +905,9 @@ async fn cmd_bundle(app: &App, machine: &str, action: BundleAction) -> Result<()
         }
         BundleAction::Merge { id, hand } => {
             let (all, i) = find_bundle(&id)?;
-            crate::engine::bundle::merge(app, all, i, &hand).await
+            let report = crate::engine::bundle::merge(all, i, &hand).await?;
+            say_report(app, &report);
+            Ok(())
         }
         BundleAction::Pause { id, on } => {
             let (mut all, i) = find_bundle(&id)?;

@@ -3,12 +3,14 @@
 //! Автоматике принадлежит подготовка (ребейз, гейты, порядок), человеку —
 //! решение. Поэтому из терминала доступно ровно то же, что кнопкой в панели:
 //! влить голову очереди, и только когда она перебазирована и зелена.
+//!
+//! Движок ничего не печатает, а ВОЗВРАЩАЕТ отчёт строками. Читателей двое:
+//! команда, которая печатает их в поток, и живое окно, где любая печать мимо
+//! кадра порвала бы экран.
 
-use crate::app::App;
 use crate::core::machine::{self, Machine};
 use crate::core::state::{self, Bundle, HandState};
 use crate::core::util::now_ms;
-use crate::ui::style::{paint, Role};
 use std::time::Duration;
 
 fn host_for(b: &Bundle) -> Result<Machine, String> {
@@ -76,12 +78,16 @@ async fn base_checkout(m: &Machine, dir: &str, base: &str) -> Option<(String, bo
 /// дереве человека. Чистое двигаем честным `merge --ff-only`; грязное не
 /// трогаем вовсе — «закоммить или спрячь» лучше, чем молча испортить правку.
 pub async fn merge(
-    app: &App,
     mut all: Vec<Bundle>,
     idx: usize,
     hand_needle: &str,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let b = all[idx].clone();
+    // Пауза — это решение человека «стоп»; вливать в обход него значит делать
+    // ровно то, от чего он остановился.
+    if b.paused {
+        return Err("связка на паузе — сними паузу, тогда волью".into());
+    }
     let m = host_for(&b)?;
     let base = if b.base.trim().is_empty() {
         "main"
@@ -151,20 +157,14 @@ pub async fn merge(
     ));
     state::save_bundles(&all).map_err(|e| format!("не записал состояние: {e}"))?;
 
-    app.say(paint(
-        &app.caps,
-        Role::Accent,
-        &format!("влито: {name} → {base}"),
-    ));
+    let mut report = vec![format!("влито: {name} → {base}")];
     let left = all[idx].queue().len();
     if left > 0 {
-        app.say(paint(
-            &app.caps,
-            Role::Dim,
-            &format!("в очереди ещё {left} — хвост переребейзится и пересдаст гейты"),
+        report.push(format!(
+            "в очереди ещё {left} — хвост переребейзится и пересдаст гейты"
         ));
     }
-    Ok(())
+    Ok(report)
 }
 
 /* ---------- новая рука ---------- */
@@ -208,13 +208,11 @@ fn parent_of(dir: &str) -> String {
 }
 
 /// Завести руку и поднять её агента: worktree, сессия, задача.
-pub async fn add_hand(
-    app: &App,
-    mut all: Vec<Bundle>,
-    idx: usize,
-    task: &str,
-) -> Result<(), String> {
+pub async fn add_hand(mut all: Vec<Bundle>, idx: usize, task: &str) -> Result<Vec<String>, String> {
     let b = all[idx].clone();
+    if b.paused {
+        return Err("связка на паузе — новые руки не поднимаются".into());
+    }
     let m = host_for(&b)?;
     let base = if b.base.trim().is_empty() {
         "main"
@@ -277,13 +275,10 @@ pub async fn add_hand(
     all[idx].event(format!("{name}: рука запущена · {branch}"));
     state::save_bundles(&all).map_err(|e| format!("не записал состояние: {e}"))?;
 
-    app.say(paint(
-        &app.caps,
-        Role::Accent,
-        &format!("рука «{name}» работает · {branch}"),
-    ));
-    app.dim(&format!("worktree {wt}"));
-    Ok(())
+    Ok(vec![
+        format!("рука «{name}» работает · {branch}"),
+        format!("worktree {wt}"),
+    ])
 }
 
 #[cfg(test)]
@@ -345,6 +340,20 @@ mod tests {
         assert_eq!(b.queue()[0].name, "reducer");
     }
 
+    /// Пауза сильнее любой клавиши: человек остановил связку сам.
+    #[tokio::test]
+    async fn a_paused_bundle_refuses_both_merge_and_new_hands() {
+        let b = Bundle {
+            paused: true,
+            hands: vec![hand("h1", "auth", HandState::Ready, 1, true)],
+            ..Default::default()
+        };
+        let err = merge(vec![b.clone()], 0, "auth").await.unwrap_err();
+        assert!(err.contains("на паузе"), "{err}");
+        let err = add_hand(vec![b], 0, "почини тесты").await.unwrap_err();
+        assert!(err.contains("на паузе"), "{err}");
+    }
+
     #[tokio::test]
     async fn merging_a_non_head_is_refused_by_name() {
         let b = Bundle {
@@ -357,8 +366,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let app = App::new(false);
-        let err = merge(&app, vec![b], 0, "docs").await.unwrap_err();
+        let err = merge(vec![b], 0, "docs").await.unwrap_err();
         assert!(err.contains("только голова"), "{err}");
         assert!(
             err.contains("reducer"),
@@ -372,8 +380,7 @@ mod tests {
             hands: vec![hand("h1", "auth", HandState::Working, 0, false)],
             ..Default::default()
         };
-        let app = App::new(false);
-        let err = merge(&app, vec![b], 0, "auth").await.unwrap_err();
+        let err = merge(vec![b], 0, "auth").await.unwrap_err();
         assert!(err.contains("очередь пуста"), "{err}");
     }
 
@@ -383,8 +390,7 @@ mod tests {
             hands: vec![hand("h1", "auth", HandState::Ready, 1, false)],
             ..Default::default()
         };
-        let app = App::new(false);
-        let err = merge(&app, vec![b], 0, "auth").await.unwrap_err();
+        let err = merge(vec![b], 0, "auth").await.unwrap_err();
         assert!(err.contains("гейты не зелёные"), "{err}");
     }
 }
