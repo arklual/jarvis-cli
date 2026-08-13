@@ -332,7 +332,22 @@ pub async fn connect(m: &Machine) -> Result<(NodeClient, Option<Tunnel>), String
         return Ok((NodeClient::unix(sock), None));
     }
     let t = open_tunnel(m).await?;
-    Ok((NodeClient::tcp(format!("127.0.0.1:{}", t.port)), Some(t)))
+    let client = NodeClient::tcp(format!("127.0.0.1:{}", t.port));
+    // Туннель к НЕсуществующему сокету поднимается как ни в чём не бывало:
+    // ssh узнаёт правду только в момент запроса и молча рвёт соединение.
+    // Поэтому здороваемся сразу — иначе человек получил бы «connection reset»
+    // на каждую команду и ни одного слова про причину: каталог узла.
+    if let Err(e) = client.hello().await {
+        return Err(format!(
+            "ssh пускает, но узел на {} не отвечает ({e}). \
+             Если он живёт в другом каталоге — впиши его: \
+             jarvis machine add {} {} --dir /путь/к/каталогу",
+            node_sock(&m.dir),
+            m.name,
+            m.ssh_host
+        ));
+    }
+    Ok((client, Some(t)))
 }
 
 /// Выполнить команду на машине: локально через шелл, на узле — по ssh.
