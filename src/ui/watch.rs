@@ -1,8 +1,6 @@
-//! Живой экран и уведомления.
+//! Уведомления: переходы состояний строкой, для звука и всплывашек.
 //!
-//! Экран перерисовывается на месте — курсор в начало и очистка вниз, без
-//! альт-экрана: человек уходит из `jarvis` и видит свою историю команд, а не
-//! стёртый терминал. То же соображение, что у `top` против `less`.
+//! Живое окно переехало в `live` — здесь остался поток событий для пайпа.
 //!
 //! Уведомления печатаются НА ПЕРЕХОДАХ, а не на состоянии: иначе каждая
 //! страница событий заново сообщала бы «агент закончил» про то же самое — а
@@ -11,8 +9,7 @@
 use crate::app::App;
 use crate::core::machine;
 use crate::core::session::{self, Session, Status};
-use crate::ui::render;
-use crate::ui::style::{paint, rule, Role};
+use crate::ui::style::{paint, Role};
 use std::collections::HashMap;
 use std::io::Write;
 use std::time::Duration;
@@ -76,143 +73,6 @@ pub fn notify_line(c: &Change) -> String {
         c.session,
         crate::core::util::ellipsize(&c.text, 160)
     )
-}
-
-/// Живой экран: перерисовываем список, пока не нажали q или Ctrl-C.
-pub async fn run(app: &App, machine_name: &str) -> Result<(), String> {
-    let m = machine::list()
-        .into_iter()
-        .find(|m| m.name == machine_name)
-        .ok_or_else(|| format!("нет машины «{machine_name}»"))?;
-    let (client, _tunnel) = machine::connect(&m).await?;
-
-    // Сырой режим — только чтобы поймать «q» без Enter. Восстанавливается в
-    // Drop, иначе брошенный терминал остался бы без эха.
-    let raw = RawGuard::enable();
-    let mut reg = crate::app::registry(&client).await.unwrap_or_default();
-    let mut cursor = client.hello().await.map(|h| h.cursor).unwrap_or(0);
-    let mut recent: Vec<Change> = Vec::new();
-    // Полоска лимитов внизу — как в панели. Узел отдаёт её из кэша, так что
-    // круг экрана она не тормозит; раз в пять минут обновляем.
-    let mut limits: Vec<render::Window> = Vec::new();
-    let mut limits_at = 0i64;
-
-    loop {
-        if crate::core::util::now_ms() - limits_at > 5 * 60_000 {
-            // Время ставим ДО запроса: если узел не умеет /usage, незачем
-            // ломиться к нему каждый круг.
-            limits_at = crate::core::util::now_ms();
-            if let Ok(text) = client.usage_text(false).await {
-                limits = crate::app::parse_usage(&text);
-            }
-        }
-        draw(app, &m.name, &reg, &recent, &limits);
-        if pressed_quit()? {
-            break;
-        }
-        match client.events(cursor).await {
-            Ok(page) => {
-                cursor = page.cursor;
-                if page.gap {
-                    // Лента порвалась: пересобираем молча — сравнивать не с
-                    // чем, и объявлять новостью всё подряд нечестно.
-                    reg = crate::app::registry(&client).await.unwrap_or_default();
-                } else if !page.events.is_empty() {
-                    let next = session::apply(&reg, &page.events);
-                    let fresh = changes(&reg, &next);
-                    for c in fresh {
-                        recent.push(c);
-                    }
-                    let extra = recent.len().saturating_sub(5);
-                    recent.drain(..extra);
-                    reg = next;
-                }
-            }
-            Err(_) => tokio::time::sleep(IDLE).await,
-        }
-    }
-    drop(raw);
-    Ok(())
-}
-
-fn draw(
-    app: &App,
-    machine_name: &str,
-    reg: &HashMap<String, Session>,
-    recent: &[Change],
-    limits: &[render::Window],
-) {
-    let list = session::sorted(reg);
-    let mut out = String::new();
-    // Курсор в начало и очистка вниз: перерисовка без мигания и без
-    // альт-экрана, чтобы после выхода осталась история команд.
-    out.push_str("\x1b[H\x1b[J");
-    out.push_str(&rule(&app.caps, &format!("Jarvis · {machine_name}")));
-    out.push('\n');
-    if list.is_empty() {
-        out.push_str(&paint(&app.caps, Role::Dim, "Ни одной сессии."));
-        out.push('\n');
-    } else {
-        let col = render::name_column(&list);
-        for s in &list {
-            out.push_str(&render::session_row(&app.caps, s, col));
-            out.push('\n');
-        }
-    }
-    out.push('\n');
-    out.push_str(&render::tally_line(&app.caps, &session::tally(&list)));
-    out.push('\n');
-    if !recent.is_empty() {
-        out.push('\n');
-        out.push_str(&rule(&app.caps, "недавнее"));
-        out.push('\n');
-        for c in recent {
-            let role = if c.kind == Status::Waiting {
-                Role::Accent
-            } else {
-                Role::Dim
-            };
-            out.push_str(&paint(&app.caps, role, &notify_line(c)));
-            out.push('\n');
-        }
-    }
-    out.push('\n');
-    out.push_str(&render::limits_line(&app.caps, limits));
-    out.push('\n');
-    out.push_str(&paint(&app.caps, Role::Dim, "q — выход"));
-    print!("{out}");
-    let _ = std::io::stdout().flush();
-}
-
-/// Нажата ли «q». Не блокирует: экран должен обновляться и без клавиш.
-fn pressed_quit() -> Result<bool, String> {
-    use crossterm::event::{poll, read, Event, KeyCode};
-    if !poll(Duration::from_millis(120)).map_err(|e| e.to_string())? {
-        return Ok(false);
-    }
-    match read().map_err(|e| e.to_string())? {
-        Event::Key(k) => Ok(matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)),
-        _ => Ok(false),
-    }
-}
-
-/// Сырой режим терминала с гарантированным восстановлением.
-struct RawGuard(bool);
-
-impl RawGuard {
-    fn enable() -> Self {
-        Self(crossterm::terminal::enable_raw_mode().is_ok())
-    }
-}
-
-impl Drop for RawGuard {
-    fn drop(&mut self) {
-        if self.0 {
-            let _ = crossterm::terminal::disable_raw_mode();
-        }
-        // Курсор на новую строку: иначе приглашение шелла ляжет поверх вывода.
-        println!();
-    }
 }
 
 /// Печатать переходы по мере появления — для связки со звуком или notify-send.

@@ -179,6 +179,94 @@ pub fn item_line(caps: &Caps, it: &Item) -> String {
 }
 
 /// Показать чат и дочитывать, пока не прервут.
+/// Лента одного транскрипта, читаемая по кусочку.
+///
+/// Состояние чтения вынесено в структуру, потому что читателей двое: команда
+/// `jarvis chat`, которая печатает поток, и живое окно, которое дочитывает
+/// между нажатиями клавиш. Договор о перезаписи файла и об обрезанной первой
+/// строке обязан быть один — второй экземпляр этой логики разошёлся бы с
+/// первым в первый же месяц.
+pub struct Feed {
+    path: String,
+    offset: u64,
+    known: u64,
+    rest: String,
+    first: bool,
+    /// Транскрипта может не быть вовсе: сессия ещё ничего не писала.
+    pub missing: bool,
+    /// Дочитали до конца файла — можно и подождать.
+    pub eof: bool,
+}
+
+impl Feed {
+    /// Открыть ленту с хвоста: человеку нужен разговор, а не архив.
+    pub async fn open(client: &NodeClient, path: &str) -> Result<Self, String> {
+        let size = client
+            .file(path, u64::MAX)
+            .await?
+            .map(|c| c.size)
+            .unwrap_or(0);
+        Ok(Self {
+            path: path.to_string(),
+            offset: size.saturating_sub(TAIL_BYTES),
+            known: size,
+            rest: String::new(),
+            first: true,
+            missing: false,
+            eof: false,
+        })
+    }
+
+    /// Дочитать появившееся. Пустой ответ — нормально: ничего не написали.
+    pub async fn poll(&mut self, client: &NodeClient) -> Result<Vec<Item>, String> {
+        let Some(chunk) = client.file(&self.path, self.offset).await? else {
+            self.missing = true;
+            self.eof = true;
+            return Ok(Vec::new());
+        };
+        self.missing = false;
+        if chunk.rewound(self.offset, self.known) {
+            // Файл переписали (`/clear`, новый rollout): начинаем с начала
+            // нового, иначе лента молча замрёт навсегда.
+            self.offset = 0;
+            self.known = 0;
+            self.rest.clear();
+            self.first = true;
+            self.eof = false;
+            return Ok(Vec::new());
+        }
+        let mut text = chunk.data.clone();
+        if self.first && self.offset > 0 {
+            // Первая строка почти наверняка обрезана посередине — она из тех
+            // байт, что мы решили не читать.
+            text = text
+                .split_once('\n')
+                .map(|(_, r)| r.to_string())
+                .unwrap_or_default();
+        }
+        self.offset = chunk.next;
+        self.known = chunk.size;
+        self.first = false;
+        self.eof = chunk.eof;
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+        let combined = format!("{}{}", self.rest, text);
+        match combined.rfind('\n') {
+            None => {
+                self.rest = combined;
+                Ok(Vec::new())
+            }
+            Some(cut) => {
+                let whole = combined[..cut].to_string();
+                self.rest = combined[cut + 1..].to_string();
+                Ok(parse(&whole))
+            }
+        }
+    }
+}
+
+/// Показать чат и дочитывать, пока не прервут.
 pub async fn tail(
     app: &App,
     client: &NodeClient,
@@ -187,62 +275,19 @@ pub async fn tail(
     follow: bool,
 ) -> Result<(), String> {
     app.say(crate::ui::style::rule(&app.caps, title));
-
-    let head = client.file(path, u64::MAX).await?;
-    let size = head.map(|c| c.size).unwrap_or(0);
-    let mut offset = size.saturating_sub(TAIL_BYTES);
-    let mut known = size;
-    let mut rest = String::new();
-    let mut first = true;
-
+    let mut feed = Feed::open(client, path).await?;
     loop {
-        let Some(chunk) = client.file(path, offset).await? else {
-            if !follow {
-                app.dim("транскрипта ещё нет — сессия не слала событий");
-                return Ok(());
-            }
-            tokio::time::sleep(IDLE).await;
-            continue;
-        };
-        if chunk.rewound(offset, known) {
-            // Файл переписали (`/clear`, новый rollout): начинаем заново с
-            // начала нового, иначе лента молча замрёт навсегда.
-            offset = 0;
-            known = 0;
-            rest.clear();
-            first = true;
-            continue;
+        for it in feed.poll(client).await? {
+            app.say(item_line(&app.caps, &it));
         }
-        let mut text = chunk.data.clone();
-        if first && offset > 0 {
-            // Первая строка почти наверняка обрезана посередине — она из тех
-            // байт, что мы решили не читать.
-            text = text
-                .split_once('\n')
-                .map(|(_, r)| r.to_string())
-                .unwrap_or_default();
-        }
-        offset = chunk.next;
-        known = chunk.size;
-        first = false;
-
-        if !text.is_empty() {
-            let combined = format!("{rest}{text}");
-            match combined.rfind('\n') {
-                None => rest = combined,
-                Some(cut) => {
-                    let whole = &combined[..cut];
-                    rest = combined[cut + 1..].to_string();
-                    for it in parse(whole) {
-                        app.say(item_line(&app.caps, &it));
-                    }
-                }
-            }
-        }
-        if !follow && chunk.eof {
+        if feed.missing && !follow {
+            app.dim("транскрипта ещё нет — сессия не слала событий");
             return Ok(());
         }
-        if chunk.eof {
+        if feed.eof {
+            if !follow {
+                return Ok(());
+            }
             tokio::time::sleep(IDLE).await;
         }
     }

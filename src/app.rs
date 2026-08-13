@@ -116,7 +116,7 @@ pub async fn run(parsed: Parsed) -> Result<(), String> {
             Ok(())
         }
         Cmd::Ls => cmd_ls(&app, &parsed.machine).await,
-        Cmd::Watch => crate::ui::watch::run(&app, &parsed.machine).await,
+        Cmd::Watch => crate::ui::live::run(&app, &parsed.machine).await,
         Cmd::Reply { session, text } => cmd_reply(&app, &parsed.machine, &session, &text).await,
         Cmd::Answer { session, option } => {
             cmd_answer(&app, &parsed.machine, &session, option).await
@@ -212,7 +212,7 @@ async fn cmd_answer(app: &App, machine_name: &str, needle: &str, option: u8) -> 
     client
         .keys(
             pane_of(s)?,
-            serde_json::json!([{ "key": option.to_string() }]),
+            crate::core::node::key_plan(&option.to_string()),
         )
         .await?;
     app.say(format!(
@@ -234,7 +234,7 @@ async fn cmd_key(
     let list = session::sorted(&reg);
     let s = resolve(&list, needle)?;
     client
-        .keys(pane_of(s)?, serde_json::json!([{ "key": key }]))
+        .keys(pane_of(s)?, crate::core::node::key_plan(key))
         .await?;
     app.dim(&format!("{word} — {}", s.title()));
     Ok(())

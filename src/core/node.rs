@@ -95,6 +95,14 @@ pub struct RemoteProject {
     pub last_at: i64,
 }
 
+/// План нажатий для `/keys`.
+///
+/// Узел ждёт `[{"key":"Escape"}]` и отвечает отказом на `["Escape"]` —
+/// перепутать легко, а видно это только по 400 из узла, уже в бою.
+pub fn key_plan(key: &str) -> Value {
+    serde_json::json!([{ "key": key }])
+}
+
 const CONNECT: Duration = Duration::from_secs(5);
 const READ: Duration = Duration::from_secs(12);
 /// Long-poll `/events` узел держит до 25 с — читаем дольше.
@@ -182,7 +190,8 @@ impl NodeClient {
             .await
     }
 
-    /// Клавиши в пану: `[{"key":"Escape"}]`, `[{"key":"1"}]`…
+    /// Клавиши в пану. План собирайте через [`key_plan`] — узел принимает
+    /// только объекты `{key}`/`{text}`, а голый список строк отвергает.
     pub async fn keys(&self, pane: &str, keys: Value) -> Result<(), String> {
         self.post("/keys", &serde_json::json!({ "pane": pane, "keys": keys }))
             .await
@@ -412,6 +421,63 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Форма плана клавиш — договор с узлом, а не наше усмотрение.
+    #[test]
+    fn key_plan_is_a_list_of_objects() {
+        assert_eq!(key_plan("Escape"), serde_json::json!([{ "key": "Escape" }]));
+        assert!(
+            key_plan("2")[0].get("key").is_some(),
+            "голая строка узлу не подходит"
+        );
+    }
+
+    /// Разговор с настоящим сокетом: поддельный узел записывает запрос, а мы
+    /// сверяем, что ушло. Отправка ответа агенту — то место, где ошибка
+    /// молчалива: команда «успешна», а текст не доехал ни до кого.
+    #[tokio::test]
+    async fn reply_goes_out_as_a_post_with_pane_and_text() {
+        let dir = std::env::temp_dir().join(format!("jarvis-cli-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("node.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            let (mut st, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = tokio::io::AsyncReadExt::read(&mut st, &mut buf)
+                .await
+                .unwrap();
+            *seen2.lock().await = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let body = b"{\"ok\":true}";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut st, head.as_bytes())
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut st, body)
+                .await
+                .unwrap();
+        });
+
+        let client = NodeClient::unix(sock.to_string_lossy().into_owned());
+        client
+            .reply("%7", "привет, агент")
+            .await
+            .expect("узел ответил ok");
+
+        let req = seen.lock().await.clone();
+        assert!(req.starts_with("POST /reply "), "{req}");
+        assert!(req.contains("\"pane\":\"%7\""), "{req}");
+        // Русский текст обязан доехать как есть — иначе агент получит мусор.
+        assert!(req.contains("привет, агент"), "{req}");
+        let _ = std::fs::remove_file(&sock);
+    }
 
     #[test]
     fn http_response_is_parsed_with_content_length() {
