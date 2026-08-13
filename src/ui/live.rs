@@ -22,7 +22,9 @@ use crate::core::session::{self, Session};
 use crate::core::state;
 use crate::core::util::now_ms;
 use crate::ui::chat::{self, Feed, Item};
+use crate::ui::editor::Editor;
 use crate::ui::render::{self, Window};
+use crate::ui::slash;
 use crate::ui::style::{band, header, key, pad, paint, truncate, width, Bg, Caps, Role};
 use crossterm::event::{poll, read, Event, KeyCode, KeyEvent, KeyModifiers};
 use std::io::Write;
@@ -40,6 +42,19 @@ const DISK_EVERY: i64 = 1000;
 /// Потолок ленты в памяти: чат живёт часами, и без предела окно однажды
 /// съедает гигабайт — урок настольной версии.
 const MAX_ITEMS: usize = 2000;
+
+/// Что набирают в строке ввода. Пустой ввод в чате — тоже набор: там строка
+/// всегда наготове, и это единственный вид, где буквы принадлежат тексту.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Typing {
+    None,
+    /// Ответ агенту в чате.
+    Message,
+    /// Задача новой руки связки.
+    Task,
+    /// Команда окна: строка начинается со слэша.
+    Command,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum View {
@@ -79,6 +94,18 @@ pub enum Act {
     Pause,
     /// Новая рука: спросить задачу.
     NewHand,
+    /// Правка строки ввода.
+    Left,
+    Right,
+    Home,
+    End,
+    Delete,
+    /// Перевод строки внутри сообщения.
+    Newline,
+    /// Дополнить команду.
+    Tab,
+    /// Начать команду с «/».
+    Slash,
     None,
 }
 
@@ -89,14 +116,28 @@ pub fn map_key(view_is_text: bool, k: KeyEvent) -> Act {
     // Alt+клавиша терминал шлёт как ESC перед этой клавишей — то же, что
     // «нажали Esc, потом её». Считаем это Escape: иначе быстрый Esc перед
     // следующим нажатием слипается в Alt и молча превращается в букву.
+    // Alt+Enter — перевод строки внутри сообщения; проверяем ДО общего
+    // правила про Alt, иначе он превратится в Escape и сотрёт набранное.
     if k.modifiers.contains(KeyModifiers::ALT) {
-        return Act::Escape;
+        return match k.code {
+            KeyCode::Enter => Act::Newline,
+            _ => Act::Escape,
+        };
     }
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     if ctrl {
         return match k.code {
             KeyCode::Char('c') => Act::Quit,
             KeyCode::Char('u') => Act::KillLine,
+            // Терминалы, где Alt+Enter не доходит, оставляют Ctrl+O — это
+            // общий для readline способ сказать «перевод строки».
+            KeyCode::Char('o') => Act::Newline,
+            KeyCode::Char('a') => Act::Home,
+            KeyCode::Char('e') => Act::End,
+            // Ctrl+D намеренно НЕ «удалить символ»: этим кодом терминал
+            // сообщает о конце ввода, и он прилетает сам, когда стдин
+            // закрывается. Поймано следом нажатий: символ под курсором
+            // исчезал без единого нажатия человека.
             // В сыром режиме перевод строки приходит как Ctrl+J, а не Enter:
             // так его отдают часть терминалов и всё, что печатает в пану
             // программно. Для человека это тот же Enter.
@@ -121,9 +162,18 @@ pub fn map_key(view_is_text: bool, k: KeyEvent) -> Act {
         }
         KeyCode::Up => Act::Up,
         KeyCode::Down => Act::Down,
+        KeyCode::Left => Act::Left,
+        KeyCode::Right => Act::Right,
+        KeyCode::Home => Act::Home,
+        KeyCode::End => Act::End,
+        KeyCode::Delete => Act::Delete,
+        KeyCode::Tab => Act::Tab,
         KeyCode::PageUp => Act::PageUp,
         KeyCode::PageDown => Act::PageDown,
         KeyCode::Backspace => Act::Backspace,
+        // Слэш открывает командную строку из любого вида: команды `jarvis`
+        // человек уже знает, и заново учить клавиши окна незачем.
+        KeyCode::Char('/') if !view_is_text => Act::Slash,
         KeyCode::Char(c) if view_is_text => Act::Type(c),
         KeyCode::Char('q') => Act::Quit,
         KeyCode::Char('j') => Act::Down,
@@ -158,7 +208,9 @@ struct Ui {
     view: View,
     prev: View,
     sel: usize,
-    input: String,
+    input: Editor,
+    /// Что сейчас набирают: ответ агенту, задачу руке или команду.
+    typing: Typing,
     status: String,
     scroll: usize,
     feed: Option<Feed>,
@@ -179,8 +231,6 @@ struct Ui {
     bsel: usize,
     hsel: usize,
     open_bundle: String,
-    /// Набираем задачу новой руки: ввод занят не ответом агенту.
-    composing: bool,
     /// Долгое действие уже идёт. Второе нажатие «влить» подряд — это два
     /// слияния, а очередь такого не прощает.
     busy: Option<String>,
@@ -192,7 +242,8 @@ impl Default for Ui {
             view: View::List,
             prev: View::List,
             sel: 0,
-            input: String::new(),
+            input: Editor::default(),
+            typing: Typing::None,
             status: String::new(),
             scroll: 0,
             feed: None,
@@ -211,7 +262,6 @@ impl Default for Ui {
             bsel: 0,
             hsel: 0,
             open_bundle: String::new(),
-            composing: false,
             busy: None,
         }
     }
@@ -266,7 +316,8 @@ pub async fn run(app: &App, machine_name: &str) -> Result<(), String> {
             let Event::Key(k) = read().map_err(|e| e.to_string())? else {
                 continue;
             };
-            let act = map_key(ui.view == View::Chat || ui.composing, k);
+            let act = map_key(typing_now(&ui), k);
+            keylog(&k, &act, &ui);
             if !handle(&mut ui, act, &client, &list, &caps, &tx).await {
                 drop(raw);
                 poller.abort();
@@ -367,6 +418,55 @@ fn toggle_pause(id: &str, on: bool) -> Result<(), String> {
     state::save_bundles(&all).map_err(|e| format!("не записал состояние: {e}"))
 }
 
+/// След нажатий в файл — по просьбе `JARVIS_KEYLOG`.
+///
+/// «Клавиша не работает» — жалоба, которую без записи не проверить: терминалы
+/// шлют одну и ту же клавишу по-разному, а часть кодов приходит сама (Ctrl+D
+/// при закрытии ввода). Один такой след уже нашёл здесь съеденную букву.
+fn keylog(k: &KeyEvent, act: &Act, ui: &Ui) {
+    let Ok(path) = std::env::var("JARVIS_KEYLOG") else {
+        return;
+    };
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{k:?} -> {act:?} | {:?}", ui.input.text());
+    }
+}
+
+/// Строка ввода сейчас принимает буквы: в чате она всегда наготове, в
+/// остальных видах — только когда что-то набирают.
+fn typing_now(ui: &Ui) -> bool {
+    ui.typing != Typing::None
+}
+
+/// Куда вернуться после команды: в чате строка ввода остаётся наготове, в
+/// остальных видах буквы снова принадлежат навигации.
+fn idle_typing(ui: &Ui) -> Typing {
+    if ui.view == View::Chat {
+        Typing::Message
+    } else {
+        Typing::None
+    }
+}
+
+/// Палитра показывается, пока строка похожа на команду.
+fn palette(ui: &Ui) -> Vec<&'static slash::Command> {
+    let line = ui.input.text();
+    if !line.starts_with('/') || line.starts_with("//") {
+        return Vec::new();
+    }
+    let head = line.split_whitespace().next().unwrap_or("/");
+    // Как только команда набрана целиком и пошли аргументы, палитра лишняя.
+    if line.contains(char::is_whitespace) && slash::matching(head).len() == 1 {
+        return Vec::new();
+    }
+    slash::matching(head)
+}
+
 /// Открытая сейчас связка.
 fn current_bundle(ui: &Ui) -> Option<&state::Bundle> {
     ui.bundles.iter().find(|b| b.id == ui.open_bundle)
@@ -390,25 +490,33 @@ async fn handle(
     let cur = list.get(ui.sel).cloned();
     match act {
         Act::Quit => return false,
-        Act::Escape if ui.composing => {
-            ui.composing = false;
+        // Отмена набора — отдельный шаг: Esc в наборе не должен ещё и
+        // выбрасывать из вида, где человек стоит.
+        Act::Escape if matches!(ui.typing, Typing::Command | Typing::Task) => {
             ui.input.clear();
+            ui.typing = idle_typing(ui);
             ui.status.clear();
         }
+        Act::Escape if ui.view == View::Chat && !ui.input.is_empty() => ui.input.clear(),
         Act::Escape => match ui.view {
             View::List => return false,
-            View::Chat if !ui.input.is_empty() => ui.input.clear(),
             View::Bundle => {
                 ui.view = View::Bundles;
                 ui.open_bundle.clear();
+                ui.typing = Typing::None;
             }
             _ => {
                 ui.view = View::List;
                 ui.feed = None;
                 ui.items.clear();
                 ui.scroll = 0;
+                ui.typing = Typing::None;
             }
         },
+        // В многострочном сообщении стрелки принадлежат курсору: иначе
+        // вторую строку не поправить, не стерев её целиком.
+        Act::Up if typing_now(ui) && ui.input.is_multiline() => ui.input.up(),
+        Act::Down if typing_now(ui) && ui.input.is_multiline() => ui.input.down(),
         Act::Up => match ui.view {
             View::List => ui.sel = ui.sel.saturating_sub(1),
             View::Chat => ui.scroll += 1,
@@ -466,6 +574,7 @@ async fn handle(
                         ui.open_id = s.id.clone();
                         ui.open_title = format!("{} · {}", b.name, h.name);
                         ui.view = View::Chat;
+                        ui.typing = Typing::Message;
                         ui.status.clear();
                     }
                     Err(e) => ui.status = e,
@@ -488,6 +597,7 @@ async fn handle(
                         ui.open_id = s.id.clone();
                         ui.open_title = s.title();
                         ui.view = View::Chat;
+                        ui.typing = Typing::Message;
                         ui.status.clear();
                     }
                     Err(e) => ui.status = e,
@@ -535,8 +645,8 @@ async fn handle(
                 _ => ui.status = "сессия не в tmux — вариант не отправить".into(),
             }
         }
-        Act::Send if ui.composing => {
-            let task = ui.input.trim().to_string();
+        Act::Send if ui.typing == Typing::Task => {
+            let task = ui.input.text().trim().to_string();
             if task.is_empty() {
                 ui.status = "рука без задачи не поднимется".into();
                 return true;
@@ -544,7 +654,7 @@ async fn handle(
             let Some(b) = current_bundle(ui).cloned() else {
                 return true;
             };
-            ui.composing = false;
+            ui.typing = idle_typing(ui);
             ui.input.clear();
             ui.busy = Some("поднимаю руку".into());
             ui.status = "поднимаю руку: worktree, ветка, агент…".into();
@@ -558,36 +668,77 @@ async fn handle(
             });
         }
         Act::Send => {
-            let text = ui.input.trim().to_string();
-            if text.is_empty() {
+            let line = ui.input.text().to_string();
+            if line.trim().is_empty() {
                 return true;
             }
-            let pane = list
-                .iter()
-                .find(|s| s.id == ui.open_id)
-                .and_then(|s| s.pane.clone())
-                .unwrap_or_default();
-            if pane.is_empty() {
-                ui.status = "сессия не в tmux — отвечать некуда".into();
-                return true;
-            }
-            match client.reply(&pane, &text).await {
-                Ok(_) => {
+            match slash::parse(&line) {
+                slash::Line::Cmd { name, rest } => {
                     ui.input.clear();
-                    ui.scroll = 0;
-                    // Своё сообщение не дорисовываем: оно приедет из
-                    // транскрипта, и подделка рядом с настоящей строкой
-                    // выглядела бы двойной отправкой.
-                    ui.status = format!("→ {}", truncate(&text, (caps.width as usize).min(60)));
+                    let alive = run_slash(ui, &name, &rest, client, list, caps, tx).await;
+                    ui.typing = idle_typing(ui);
+                    return alive;
                 }
-                Err(e) => ui.status = e,
+                slash::Line::Text(text) => {
+                    if ui.view != View::Chat {
+                        ui.status = "это не команда — начни со слэша".into();
+                        return true;
+                    }
+                    let pane = list
+                        .iter()
+                        .find(|s| s.id == ui.open_id)
+                        .and_then(|s| s.pane.clone())
+                        .unwrap_or_default();
+                    if pane.is_empty() {
+                        ui.status = "сессия не в tmux — отвечать некуда".into();
+                        return true;
+                    }
+                    match client.reply(&pane, &text).await {
+                        Ok(_) => {
+                            ui.input.clear();
+                            ui.scroll = 0;
+                            // Своё сообщение не дорисовываем: оно приедет из
+                            // транскрипта, и подделка рядом с настоящей строкой
+                            // выглядела бы двойной отправкой.
+                            ui.status =
+                                format!("→ {}", truncate(&text, (caps.width as usize).min(60)));
+                        }
+                        Err(e) => ui.status = e,
+                    }
+                }
             }
         }
-        Act::Type(c) => ui.input.push(c),
-        Act::Backspace => {
-            ui.input.pop();
+        Act::Type(c) => ui.input.insert(c),
+        Act::Left => ui.input.left(),
+        Act::Right => ui.input.right(),
+        Act::Home => ui.input.home(),
+        Act::End => ui.input.end(),
+        Act::Delete => ui.input.delete(),
+        Act::Newline => ui.input.newline(),
+        Act::Tab => {
+            // Дополняем только команду: в тексте сообщения Tab — это Tab.
+            let line = ui.input.text().to_string();
+            if line.starts_with('/') {
+                let head = line.split_whitespace().next().unwrap_or("/").to_string();
+                if let Some(full) = slash::complete(&head) {
+                    let rest = line[head.len()..].to_string();
+                    ui.input.set(format!("{full}{}", rest.trim_start()));
+                }
+            }
         }
-        Act::KillLine => ui.input.clear(),
+        Act::Slash => {
+            ui.typing = Typing::Command;
+            ui.input.set("/");
+            ui.status.clear();
+        }
+        Act::Backspace => {
+            ui.input.backspace();
+            // Стёрли слэш — команды больше нет, и палитра уходит сама.
+            if ui.typing == Typing::Command && ui.input.text().is_empty() {
+                ui.typing = idle_typing(ui);
+            }
+        }
+        Act::KillLine => ui.input.kill_line(),
         Act::Merge => {
             if ui.view != View::Bundle {
                 return true;
@@ -645,7 +796,7 @@ async fn handle(
                 return true;
             }
             // Рука без задачи бессмысленна, поэтому сначала спрашиваем её.
-            ui.composing = true;
+            ui.typing = Typing::Task;
             ui.input.clear();
             ui.status = "чем займётся рука? Enter — поднять, Esc — отмена".into();
         }
@@ -660,6 +811,149 @@ async fn handle(
             }
         }
         Act::None => {}
+    }
+    true
+}
+
+/// Та же клавиша, но вызванная командой. Через `Box::pin`, потому что команда
+/// умеет делать то же, что клавиша, а клавиша — вызывать команду: без бокса
+/// такое будущее не имеет конечного размера.
+async fn as_key(
+    ui: &mut Ui,
+    act: Act,
+    client: &NodeClient,
+    list: &[Session],
+    caps: &Caps,
+    tx: &tokio::sync::mpsc::Sender<Msg>,
+) -> bool {
+    Box::pin(handle(ui, act, client, list, caps, tx)).await
+}
+
+/// Выполнить команду окна. `false` — человек вышел.
+///
+/// Неизвестное имя — не ошибка: у агента свои слэш-команды, и человек,
+/// набравший `/compact`, хочет попасть к нему, а не получить нотацию.
+async fn run_slash(
+    ui: &mut Ui,
+    name: &str,
+    rest: &str,
+    client: &NodeClient,
+    list: &[Session],
+    caps: &Caps,
+    tx: &tokio::sync::mpsc::Sender<Msg>,
+) -> bool {
+    // Кому адресована команда: открытому чату, а если его нет — выбранному в
+    // списке. Иначе `/stop` из списка молчал бы, хотя сессия перед глазами.
+    let target = list
+        .iter()
+        .find(|s| s.id == ui.open_id)
+        .or_else(|| list.get(ui.sel))
+        .cloned();
+    match name {
+        "quit" | "q" | "exit" => return false,
+        "help" => {
+            ui.prev = ui.view.clone();
+            ui.view = View::Help;
+        }
+        "list" | "ls" => {
+            ui.view = View::List;
+            ui.feed = None;
+            ui.items.clear();
+        }
+        "loops" | "loop" => ui.view = View::Loops,
+        "bundles" | "bundle" => ui.view = View::Bundles,
+        "limits" => {
+            ui.limits_at = 0; // следующий круг перечитает
+            ui.status = "обновляю лимиты…".into();
+        }
+        "chat" => {
+            let needle = if rest.is_empty() {
+                target.as_ref().map(|s| s.id.clone()).unwrap_or_default()
+            } else {
+                rest.to_string()
+            };
+            match crate::app::resolve(list, &needle) {
+                Ok(s) => {
+                    let (id, title, path) = (s.id.clone(), s.title(), s.transcript.clone());
+                    match path.filter(|p| !p.is_empty()) {
+                        Some(path) => match Feed::open(client, &path).await {
+                            Ok(f) => {
+                                ui.feed = Some(f);
+                                ui.items.clear();
+                                ui.scroll = 0;
+                                ui.feed_at = 0;
+                                ui.open_id = id;
+                                ui.open_title = title;
+                                ui.view = View::Chat;
+                                ui.typing = Typing::Message;
+                                ui.status.clear();
+                            }
+                            Err(e) => ui.status = e,
+                        },
+                        None => ui.status = format!("{title}: транскрипта ещё нет"),
+                    }
+                }
+                Err(e) => ui.status = e,
+            }
+        }
+        "screen" => return as_key(ui, Act::Screen, client, list, caps, tx).await,
+        "stop" => return as_key(ui, Act::Interrupt, client, list, caps, tx).await,
+        "merge" => return as_key(ui, Act::Merge, client, list, caps, tx).await,
+        "pause" => return as_key(ui, Act::Pause, client, list, caps, tx).await,
+        "hand" => {
+            if ui.view != View::Bundle {
+                ui.status = "рука заводится в пульте связки: /bundles, потом Enter".into();
+                return true;
+            }
+            if rest.trim().is_empty() {
+                return as_key(ui, Act::NewHand, client, list, caps, tx).await;
+            }
+            ui.typing = Typing::Task;
+            ui.input.set(rest);
+            return as_key(ui, Act::Send, client, list, caps, tx).await;
+        }
+        "run" => {
+            if rest.trim().is_empty() {
+                ui.status = "где запускать? /run <каталог>".into();
+                return true;
+            }
+            let (dir, client2, tx2) = (rest.to_string(), client.clone(), tx.clone());
+            ui.busy = Some("поднимаю агента".into());
+            ui.status = format!("поднимаю агента в {dir}…");
+            tokio::spawn(async move {
+                let name = dir
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("проект");
+                let res = client2
+                    .launch(&dir, "claude --dangerously-skip-permissions", name)
+                    .await
+                    .map(|pane| vec![format!("агент поднят, пана {pane}")]);
+                let _ = tx2.send(Msg::Done(res)).await;
+            });
+        }
+        // Всё остальное — слэш-команда самого агента: /model, /effort,
+        // /compact, /clear. Отправляем как есть той сессии, что перед глазами.
+        _ => {
+            let Some(s) = target else {
+                ui.status = format!("некому передать /{name}");
+                return true;
+            };
+            let Some(pane) = s.pane.clone().filter(|p| !p.is_empty()) else {
+                ui.status = format!("{} не в tmux — команду не передать", s.title());
+                return true;
+            };
+            let cmd = if rest.is_empty() {
+                format!("/{name}")
+            } else {
+                format!("/{name} {rest}")
+            };
+            ui.status = match client.control(&pane, &cmd).await {
+                Ok(_) => format!("{} → {cmd}", s.title()),
+                Err(e) => e,
+            };
+        }
     }
     true
 }
@@ -804,11 +1098,12 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
     push(&mut out, "");
 
     // Полосы снизу: воздух, состояние, ввод (в чате) и клавиши.
-    let body = (rows as usize).saturating_sub(if ui.view == View::Chat || ui.composing {
-        6
-    } else {
-        5
-    });
+    let body =
+        (rows as usize).saturating_sub(if ui.view == View::Chat || (ui.typing != Typing::None) {
+            6
+        } else {
+            5
+        });
     match ui.view {
         View::List => draw_list(&mut out, caps, ui, list, body),
         View::Chat => draw_chat(&mut out, caps, ui, body),
@@ -840,25 +1135,59 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
     } else {
         push(&mut out, "");
     }
-    if ui.view == View::Chat || ui.composing {
-        // Строка ввода — на подложке: видно, где кончается лента и начинается
-        // то, что ты печатаешь. Каретка — обратным цветом, как в pi.
-        let room = total.saturating_sub(6);
-        let typed = truncate(&ui.input, room);
-        let caret = if caps.color {
-            "\x1b[7m \x1b[27m".to_string()
+    // Палитра команд — над строкой ввода, как только строка похожа на команду.
+    let hits = palette(ui);
+    let col = hits
+        .iter()
+        .map(|c| {
+            1 + c.name.len()
+                + if c.args.is_empty() {
+                    0
+                } else {
+                    1 + width(c.args)
+                }
+        })
+        .max()
+        .unwrap_or(10)
+        .clamp(10, 28);
+    for c in hits.iter().take(6) {
+        let head = if c.args.is_empty() {
+            paint(caps, Role::Accent, &format!("/{}", c.name))
         } else {
-            "_".to_string()
+            format!(
+                "{} {}",
+                paint(caps, Role::Accent, &format!("/{}", c.name)),
+                paint(caps, Role::Dim, c.args)
+            )
         };
         push(
             &mut out,
-            &band(
-                caps,
-                Bg::Sel,
-                &format!("{} {typed}{caret}", paint(caps, Role::Accent, "›")),
-                total,
-            ),
+            &format!(" {}  {}", pad(&head, col), paint(caps, Role::Muted, c.what)),
         );
+    }
+    if typing_now(ui) {
+        // Строка ввода — на подложке: видно, где кончается лента и начинается
+        // то, что ты печатаешь. Каретка — обратным цветом, как в pi.
+        let room = total.saturating_sub(6);
+        let (row, col) = ui.input.row_col();
+        for (i, line) in ui.input.lines().iter().enumerate() {
+            let head = if i == 0 {
+                paint(caps, Role::Accent, "›")
+            } else {
+                // Продолжение — с отступом, чтобы многострочное сообщение
+                // читалось как одно, а не как три реплики.
+                paint(caps, Role::Dim, "│")
+            };
+            let body = if i == row {
+                with_caret(caps, line, col, room)
+            } else {
+                truncate(line, room)
+            };
+            push(
+                &mut out,
+                &band(caps, Bg::Sel, &format!("{head} {body}"), total),
+            );
+        }
     }
     push(&mut out, &format!(" {}", keys_hint(caps, ui)));
     // Хвостовой перевод строки убираем: он-то и прокручивает полный экран.
@@ -868,14 +1197,46 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
     out
 }
 
+/// Строка с кареткой: символ под курсором — обратным цветом.
+///
+/// Рисуем свою каретку, а не двигаем настоящую: кадр печатается одним куском с
+/// произвольного места, и позиция аппаратного курсора после него — вопрос
+/// удачи. Нарисованная каретка всегда там, где текст.
+fn with_caret(caps: &Caps, line: &str, col: usize, room: usize) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let before: String = chars.iter().take(col).collect();
+    let at: String = chars
+        .get(col)
+        .copied()
+        .map(String::from)
+        .unwrap_or_else(|| " ".into());
+    let after: String = chars.iter().skip(col + 1).collect();
+    if !caps.color {
+        // Без краски каретку показать нечем — покажем место словом-знаком.
+        return truncate(&format!("{before}_{at}{after}"), room);
+    }
+    let shown = format!("{before}\x1b[7m{at}\x1b[27m{after}");
+    // Обрезаем по видимой ширине: управляющие последовательности места не
+    // занимают, и truncate это уже знает.
+    truncate(&shown, room)
+}
+
 /// Строка в конце — единственная подсказка, которую человек читает. Поэтому в
 /// ней ровно то, что работает ЗДЕСЬ, а не весь список возможностей: клавиша
 /// выделена, объяснение приглушено, пары разделены точкой.
 fn keys_hint(caps: &Caps, ui: &Ui) -> String {
     let pairs: Vec<(&str, &str)> = match ui.view {
+        // Набор идёт поверх любого вида, поэтому его подсказки — первыми.
+        _ if ui.typing == Typing::Command => {
+            vec![("↵", "выполнить"), ("tab", "дополнить"), ("esc", "отмена")]
+        }
+        View::Bundle if ui.typing == Typing::Task => {
+            vec![("↵", "поднять руку"), ("esc", "отмена")]
+        }
         View::List => vec![
             ("↑↓", "выбор"),
             ("↵", "чат"),
+            ("/", "команда"),
             ("s", "экран"),
             ("x", "прервать"),
             ("1-9", "ответ"),
@@ -884,9 +1245,15 @@ fn keys_hint(caps: &Caps, ui: &Ui) -> String {
             ("?", "клавиши"),
             ("q", "выход"),
         ],
-        View::Chat => vec![("↵", "отправить"), ("↑↓", "прокрутка"), ("esc", "назад")],
+        View::Chat => vec![
+            ("↵", "отправить"),
+            ("alt+↵", "новая строка"),
+            ("←→", "курсор"),
+            ("/", "команда"),
+            ("↑↓", "прокрутка"),
+            ("esc", "назад"),
+        ],
         View::Bundles => vec![("↑↓", "выбор"), ("↵", "пульт"), ("esc", "назад")],
-        View::Bundle if ui.composing => vec![("↵", "поднять руку"), ("esc", "отмена")],
         View::Bundle => vec![
             ("↑↓", "выбор"),
             ("↵", "чат руки"),
@@ -1232,6 +1599,149 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
 
+    fn ui_in(view: View, typing: Typing) -> Ui {
+        Ui {
+            view,
+            typing,
+            ..Default::default()
+        }
+    }
+
+    async fn press(ui: &mut Ui, act: Act) -> bool {
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let client = NodeClient::unix("/nonexistent.sock");
+        handle(ui, act, &client, &[], &Caps::default(), &tx).await
+    }
+
+    /// Ctrl+D — это конец ввода, а не «удалить символ»: терминал шлёт его сам,
+    /// когда закрывается стдин, и привязка к правке стирала букву без единого
+    /// нажатия человека.
+    #[test]
+    fn ctrl_d_does_not_edit_the_line() {
+        let cd = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(map_key(true, cd), Act::None);
+        // Delete на своём месте работает как обычно.
+        assert_eq!(
+            map_key(true, KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+            Act::Delete
+        );
+    }
+
+    /// Каретка рисуется НА символе под курсором, ничего не съедая: ошибка на
+    /// единицу здесь означает пропавшую букву прямо под пальцами.
+    #[test]
+    fn caret_marks_the_character_without_eating_it() {
+        let c = Caps {
+            color: true,
+            truecolor: true,
+            unicode: true,
+            width: 40,
+        };
+        let mut e = Editor::default();
+        e.set("раз два");
+        for _ in 0..3 {
+            e.left();
+        }
+        e.insert('!');
+        assert_eq!(e.text(), "раз !два");
+        let (_, col) = e.row_col();
+        let line = with_caret(&c, e.text(), col, 40);
+        let plain = crate::ui::style::strip(&line);
+        assert_eq!(plain, "раз !два", "каретка съела букву: {plain:?}");
+        // Обратным цветом помечен ровно один символ — тот, что под курсором.
+        assert!(line.contains("\x1b[7mд\x1b[27m"), "{line:?}");
+    }
+
+    /// Слэш открывает командную строку из любого вида — команды `jarvis`
+    /// человек уже знает, и заново учить клавиши окна незачем.
+    #[tokio::test]
+    async fn slash_opens_the_command_line() {
+        let mut ui = ui_in(View::List, Typing::None);
+        assert_eq!(map_key(false, key('/')), Act::Slash);
+        press(&mut ui, Act::Slash).await;
+        assert_eq!(ui.typing, Typing::Command);
+        assert_eq!(ui.input.text(), "/");
+        assert_eq!(
+            palette(&ui).len(),
+            slash::all().len(),
+            "палитра показывает всё"
+        );
+    }
+
+    /// В чате «/» — обычный знак: путь `/etc/hosts` пишут агенту постоянно.
+    #[test]
+    fn slash_is_a_character_while_typing() {
+        assert_eq!(map_key(true, key('/')), Act::Type('/'));
+    }
+
+    #[tokio::test]
+    async fn tab_completes_commands_and_leaves_text_alone() {
+        let mut ui = ui_in(View::List, Typing::Command);
+        ui.input.set("/lim");
+        press(&mut ui, Act::Tab).await;
+        assert_eq!(ui.input.text(), "/limits");
+
+        let mut ui = ui_in(View::Chat, Typing::Message);
+        ui.input.set("просто текст");
+        press(&mut ui, Act::Tab).await;
+        assert_eq!(ui.input.text(), "просто текст", "Tab в сообщении — это Tab");
+    }
+
+    /// Палитра уходит, как только команда набрана и пошли аргументы: подсказка
+    /// поверх собственного ответа только мешает.
+    #[test]
+    fn palette_disappears_once_arguments_start() {
+        let mut ui = ui_in(View::Chat, Typing::Command);
+        ui.input.set("/li");
+        let names: Vec<&str> = palette(&ui).iter().map(|c| c.name).collect();
+        assert!(
+            names.contains(&"limits") && names.contains(&"list"),
+            "{names:?}"
+        );
+        ui.input.set("/chat lct");
+        assert!(palette(&ui).is_empty());
+        ui.input.set("//etc/hosts");
+        assert!(palette(&ui).is_empty(), "экранированный слэш — не команда");
+    }
+
+    /// Esc из команды возвращает в чат, а не выбрасывает из него.
+    #[tokio::test]
+    async fn escape_from_a_command_keeps_the_chat_open() {
+        let mut ui = ui_in(View::Chat, Typing::Command);
+        ui.input.set("/lim");
+        press(&mut ui, Act::Escape).await;
+        assert_eq!(ui.view, View::Chat);
+        assert_eq!(ui.typing, Typing::Message, "строка ввода осталась наготове");
+        assert!(ui.input.text().is_empty());
+    }
+
+    /// В многострочном сообщении стрелки принадлежат курсору: иначе вторую
+    /// строку не поправить, не стерев её целиком.
+    #[tokio::test]
+    async fn arrows_move_the_cursor_in_a_multiline_message() {
+        let mut ui = ui_in(View::Chat, Typing::Message);
+        ui.input.set("раз\nдва");
+        assert_eq!(ui.input.row_col().0, 1);
+        press(&mut ui, Act::Up).await;
+        assert_eq!(ui.input.row_col().0, 0, "курсор не поднялся");
+        assert_eq!(ui.scroll, 0, "вместо курсора прокрутилась лента");
+    }
+
+    /// Незнакомая команда — это команда агента (/compact, /clear): её нужно
+    /// передать ему, а не отчитать человека.
+    #[tokio::test]
+    async fn unknown_command_is_addressed_to_the_agent() {
+        let mut ui = ui_in(View::Chat, Typing::Message);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let client = NodeClient::unix("/nonexistent.sock");
+        run_slash(&mut ui, "compact", "", &client, &[], &Caps::default(), &tx).await;
+        assert!(
+            ui.status.contains("/compact"),
+            "команду не адресовали агенту: {}",
+            ui.status
+        );
+    }
+
     /// Клавиши пульта не должны отбирать буквы у чата: там «m» — это буква.
     #[test]
     fn bundle_keys_are_letters_while_typing() {
@@ -1307,11 +1817,14 @@ mod tests {
         let client = NodeClient::unix("/nonexistent.sock");
         let caps = Caps::default();
         handle(&mut ui, Act::NewHand, &client, &[], &caps, &tx).await;
-        assert!(ui.composing, "не спросил задачу");
+        assert!((ui.typing != Typing::None), "не спросил задачу");
         handle(&mut ui, Act::Type('д'), &client, &[], &caps, &tx).await;
-        assert_eq!(ui.input, "д");
+        assert_eq!(ui.input.text(), "д");
         handle(&mut ui, Act::Escape, &client, &[], &caps, &tx).await;
-        assert!(!ui.composing && ui.input.is_empty(), "Esc не отменил набор");
+        assert!(
+            !(ui.typing != Typing::None) && ui.input.is_empty(),
+            "Esc не отменил набор"
+        );
         assert_eq!(ui.view, View::Bundle, "Esc из набора вышвырнул из пульта");
     }
 
@@ -1319,7 +1832,7 @@ mod tests {
     #[tokio::test]
     async fn empty_task_does_not_launch_a_hand() {
         let mut ui = bundle_ui();
-        ui.composing = true;
+        ui.typing = Typing::Task;
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let client = NodeClient::unix("/nonexistent.sock");
         let caps = Caps::default();
