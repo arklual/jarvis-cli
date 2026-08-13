@@ -191,6 +191,8 @@ pub async fn run(app: &App, machine_name: &str) -> Result<(), String> {
     let raw = RawGuard::enable();
     let mut ui = Ui::default();
     let mut list = session::sorted(&reg);
+    let mut shown = String::new();
+    let mut was_size = (0u16, 0u16);
 
     loop {
         let (cols, rows) = size();
@@ -198,7 +200,14 @@ pub async fn run(app: &App, machine_name: &str) -> Result<(), String> {
             width: cols,
             ..app.caps
         };
-        draw(&caps, &m.name, &ui, &list, rows);
+        if (cols, rows) != was_size {
+            // Окно изменили: прошлый кадр больше ни о чём не говорит, а на
+            // экране остались куски старой раскладки — рисуем начисто.
+            was_size = (cols, rows);
+            shown.clear();
+            print!("\x1b[2J");
+        }
+        present(&frame(&caps, &m.name, &ui, &list, rows), &mut shown);
 
         // 1. Клавиши — первым делом: отклик важнее свежести данных.
         while poll(TICK).map_err(|e| e.to_string())? {
@@ -452,8 +461,55 @@ fn size() -> (u16, u16) {
     }
 }
 
-fn draw(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) {
-    let mut out = String::from("\x1b[H\x1b[J");
+/// Показать кадр. Здесь и только здесь решается, мигает окно или нет.
+///
+/// Мигание берётся из двух привычек, и обе выглядят безобидно:
+///
+/// 1. «Очистить экран и нарисовать заново» (`\x1b[H\x1b[J`). Между очисткой и
+///    печатью терминал успевает показать пустоту — это и есть вспышка. Вместо
+///    очистки затираем КАЖДУЮ строку по мере печати (`\x1b[K`), а `\x1b[J`
+///    делаем один раз в конце: пустого кадра не существует ни мгновения.
+/// 2. Рисовать на каждом обороте цикла. Клавиши опрашиваются двенадцать раз в
+///    секунду, и столько же раз перерисовывался неизменившийся экран. Сверяем
+///    кадр с предыдущим и молчим, если он тот же.
+///
+/// Последняя строка печатается БЕЗ перевода: кадр ростом в целый экран,
+/// закончившийся переводом строки, прокручивает терминал на строку — и весь
+/// экран дёргается вверх на каждом кадре.
+fn present(frame: &str, last: &mut String) {
+    let Some(out) = repaint(frame, last) else {
+        return;
+    };
+    let mut so = std::io::stdout().lock();
+    let _ = so.write_all(out.as_bytes());
+    let _ = so.flush();
+    last.clear();
+    last.push_str(frame);
+}
+
+/// Что именно отправить в терминал ради нового кадра. `None` — отправлять
+/// нечего: кадр тот же, и любая запись была бы чистой рябью.
+fn repaint(frame: &str, last: &str) -> Option<String> {
+    if frame == last {
+        return None;
+    }
+    let mut out = String::with_capacity(frame.len() + 64);
+    out.push_str("\x1b[H");
+    for (i, line) in frame.split("\r\n").enumerate() {
+        if i > 0 {
+            out.push_str("\r\n");
+        }
+        out.push_str(line);
+        out.push_str("\x1b[K");
+    }
+    out.push_str("\x1b[J");
+    Some(out)
+}
+
+/// Собрать кадр целиком. Чистая функция: ни печати, ни управляющих
+/// последовательностей очистки — только текст, который увидит человек.
+fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> String {
+    let mut out = String::new();
     let head = match ui.view {
         View::List => format!("Jarvis · {machine}"),
         View::Chat => format!("{} · чат", ui.open_title),
@@ -499,8 +555,11 @@ fn draw(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) {
         );
     }
     push(&mut out, &paint(caps, Role::Dim, &keys_hint(ui)));
-    print!("{out}");
-    let _ = std::io::stdout().flush();
+    // Хвостовой перевод строки убираем: он-то и прокручивает полный экран.
+    while out.ends_with("\r\n") {
+        out.truncate(out.len() - 2);
+    }
+    out
 }
 
 /// Строка в конце — единственная подсказка, которую человек читает. Поэтому в
@@ -645,6 +704,10 @@ struct RawGuard(bool);
 
 impl RawGuard {
     fn enable() -> Self {
+        // Курсор прячем на всё время окна: рисуя кадр, он пробегает по экрану
+        // и оставляет за собой мерцающий след — самая заметная часть «ряби».
+        print!("\x1b[?25l");
+        let _ = std::io::stdout().flush();
         Self(crossterm::terminal::enable_raw_mode().is_ok())
     }
 }
@@ -654,6 +717,10 @@ impl Drop for RawGuard {
         if self.0 {
             let _ = crossterm::terminal::disable_raw_mode();
         }
+        // Курсор вернуть обязаны, даже если дальше паника: терминал без
+        // курсора человек чинит вслепую, командой reset.
+        print!("\x1b[?25h");
+        let _ = std::io::stdout().flush();
         println!();
     }
 }
@@ -661,6 +728,68 @@ impl Drop for RawGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame_caps() -> Caps {
+        Caps {
+            color: false,
+            unicode: true,
+            width: 80,
+        }
+    }
+
+    fn sessions(n: usize) -> Vec<Session> {
+        (0..n)
+            .map(|i| Session {
+                id: format!("s{i}"),
+                project: Some(format!("проект-{i}")),
+                detail: "выполняет Bash".into(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    /// Кадр — это текст, а не команды терминалу. Очистка внутри кадра означала
+    /// бы, что между нею и печатью экран пуст: ровно это и мигает.
+    #[test]
+    fn frame_carries_no_screen_clearing() {
+        let f = frame(&frame_caps(), "local", &Ui::default(), &sessions(3), 24);
+        assert!(!f.contains("\x1b[J"), "очистка внутри кадра");
+        assert!(!f.contains("\x1b[H"), "перевод курсора внутри кадра");
+    }
+
+    /// Кадр ростом в целый экран, оканчивающийся переводом строки, прокручивает
+    /// терминал — и весь экран прыгает на каждом обновлении.
+    #[test]
+    fn frame_does_not_end_with_a_line_break() {
+        for rows in [8u16, 24, 60] {
+            let f = frame(&frame_caps(), "local", &Ui::default(), &sessions(40), rows);
+            assert!(!f.ends_with("\r\n"), "{rows}: хвостовой перевод строки");
+            assert!(
+                f.split("\r\n").count() <= rows as usize,
+                "{rows}: кадр выше экрана — нижние строки уедут"
+            );
+        }
+    }
+
+    #[test]
+    fn unchanged_frame_is_not_repainted() {
+        let f = frame(&frame_caps(), "local", &Ui::default(), &sessions(2), 24);
+        assert!(
+            repaint(&f, &f).is_none(),
+            "перерисовка того же кадра — это и есть мерцание"
+        );
+        let other = frame(&frame_caps(), "vps", &Ui::default(), &sessions(2), 24);
+        let out = repaint(&other, &f).expect("кадр изменился — рисуем");
+        assert!(out.starts_with("\x1b[H"));
+        assert!(out.ends_with("\x1b[J"), "хвост прошлого кадра надо стереть");
+        assert!(
+            !out.contains("\x1b[2J"),
+            "полная очистка вернула бы вспышку"
+        );
+        // Каждая строка затирается по мере печати — иначе от длинной строки
+        // прошлого кадра остаётся хвост.
+        assert_eq!(out.matches("\x1b[K").count(), other.split("\r\n").count());
+    }
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
