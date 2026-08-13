@@ -757,7 +757,9 @@ async fn cmd_loop(app: &App, action: LoopAction) -> Result<(), String> {
             if !problems.is_empty() {
                 return Err(format!("цикл не заполнен: {}", problems.join("; ")));
             }
-            crate::engine::loops::start(app, &l).await
+            // Печать — дело команды: движок теперь только рассказывает, что
+            // происходит, и тем же рассказом пользуется живое окно.
+            crate::engine::loops::start(&l, &mut |n| say_note(app, n)).await
         }
         LoopAction::Stop { id } => {
             let l = find_loop(&id)?;
@@ -796,6 +798,77 @@ fn find_bundle(id: &str) -> Result<(Vec<state::Bundle>, usize), String> {
             }
         })?;
     Ok((all, idx))
+}
+
+/// Ход цикла в поток — так, как он выглядел, когда печатал сам движок.
+fn say_note(app: &App, n: crate::engine::loops::Note) {
+    use crate::engine::loops::Note;
+    match n {
+        Note::Head {
+            name,
+            branch,
+            dir,
+            streak,
+        } => {
+            app.say(rule(&app.caps, &name));
+            app.dim(&format!("{branch} · {dir} · выход: {streak} подряд"));
+        }
+        Note::Started(n) => app.dim(&format!("итерация {n} — пошла")),
+        Note::Done(it) => app.say(render::iteration_row(&app.caps, &it)),
+        Note::Ask { name, question } => {
+            app.say(paint(
+                &app.caps,
+                Role::Warn,
+                &format!("цикл спрашивает: {question}"),
+            ));
+            app.dim(&format!(
+                "ответить: jarvis loop say {name} <текст>, дальше loop start"
+            ));
+        }
+        Note::Finished {
+            reason,
+            iterations,
+            tokens,
+            pending,
+        } => {
+            println!();
+            let role = if reason == crate::core::state::StopReason::Exit {
+                Role::Ok
+            } else {
+                Role::Muted
+            };
+            app.say(paint(
+                &app.caps,
+                role,
+                &format!(
+                    "{} · {} · {} токенов",
+                    reason.word(),
+                    crate::core::util::plural(
+                        iterations as u64,
+                        "итерация",
+                        "итерации",
+                        "итераций"
+                    ),
+                    render::fmt_tokens(tokens)
+                ),
+            ));
+            if pending > 0 {
+                app.say(paint(
+                    &app.caps,
+                    Role::Accent,
+                    &format!(
+                        "{} ждут твоего взгляда — jarvis loop show",
+                        crate::core::util::plural(
+                            pending as u64,
+                            "итерация",
+                            "итерации",
+                            "итераций"
+                        )
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 /// Отчёт движка: первая строка — итог, остальные — подробности.

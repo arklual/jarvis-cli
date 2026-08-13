@@ -7,11 +7,8 @@
 //! Отличие терминала от панели одно, и оно в его пользу: человек видит ход
 //! прямо в потоке вывода, а не в журнале постфактум.
 
-use crate::app::App;
 use crate::core::state::{self, GateRun, Iteration, Loop, Run, RunState, StopReason, Verdict};
 use crate::core::util::{ellipsize, now_ms, one_line, shell_quote};
-use crate::ui::render;
-use crate::ui::style::{paint, rule, Role};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -19,6 +16,35 @@ const ITERATION: Duration = Duration::from_secs(3600);
 const CRITIC: Duration = Duration::from_secs(600);
 const GATE: Duration = Duration::from_secs(1800);
 const DIFF_FOR_CRITIC: usize = 60_000;
+
+/// Что цикл рассказывает о себе по ходу.
+///
+/// Движок ничего не печатает: у него два зрителя — команда, которая пишет ход
+/// в поток, и живое окно, где печать мимо кадра порвала бы экран. Раньше
+/// печать была зашита внутрь, и потому цикл нельзя было запустить из окна.
+#[derive(Debug, Clone)]
+pub enum Note {
+    /// Начало прогона: где и с каким условием выхода.
+    Head {
+        name: String,
+        branch: String,
+        dir: String,
+        streak: u32,
+    },
+    /// Итерация началась.
+    Started(u32),
+    /// Итерация закончилась.
+    Done(Iteration),
+    /// Критик спрашивает человека — цикл встал.
+    Ask { name: String, question: String },
+    /// Прогон завершён.
+    Finished {
+        reason: StopReason,
+        iterations: usize,
+        tokens: u64,
+        pending: usize,
+    },
+}
 
 /// Что вернул headless-вызов агента.
 #[derive(Debug, Default, Clone)]
@@ -328,16 +354,16 @@ pub fn slug(name: &str) -> String {
 }
 
 /// Прогнать цикл, показывая ход прямо в терминале.
-pub async fn start(app: &App, l: &Loop) -> Result<(), String> {
+pub async fn start(l: &Loop, note: &mut (dyn FnMut(Note) + Send)) -> Result<(), String> {
     let run_n = state::load_run(&l.id).map(|r| r.n + 1).unwrap_or(1);
     let (dir, branch) = make_sandbox(l, run_n).await?;
 
-    app.say(rule(&app.caps, &l.name));
-    app.say(paint(
-        &app.caps,
-        Role::Dim,
-        &format!("{branch} · {dir} · выход: {} подряд", l.exit.streak),
-    ));
+    note(Note::Head {
+        name: l.name.clone(),
+        branch: branch.clone(),
+        dir: dir.clone(),
+        streak: l.exit.streak,
+    });
 
     let mut run = Run {
         loop_id: l.id.clone(),
@@ -354,7 +380,15 @@ pub async fn start(app: &App, l: &Loop) -> Result<(), String> {
     loop {
         let now = now_ms();
         if let Some(reason) = run.tripped(&l.limits, now) {
-            return finish(app, &mut run, reason);
+            return finish(&mut run, reason, note);
+        }
+        // Остановку спрашиваем у файла: её мог поставить кто угодно — окно,
+        // другой терминал, панель. Раньше «стоп» только помечал журнал, а
+        // живой прогон его не замечал и работал дальше.
+        if state::load_run(&l.id)
+            .is_some_and(|r| r.n == run.n && matches!(r.state, RunState::Stopped))
+        {
+            return finish(&mut run, StopReason::Stopped, note);
         }
         let n = run.iterations.len() as u32 + 1;
         let mut it = Iteration {
@@ -378,11 +412,7 @@ pub async fn start(app: &App, l: &Loop) -> Result<(), String> {
             String::new()
         };
 
-        app.say(paint(
-            &app.caps,
-            Role::Dim,
-            &format!("итерация {n} — пошла"),
-        ));
+        note(Note::Started(n));
         let out = run_agent(
             &dir,
             &iteration_prompt(l, &run, &tasks, &notes, &last_return),
@@ -400,7 +430,7 @@ pub async fn start(app: &App, l: &Loop) -> Result<(), String> {
             it.ended_at = now_ms();
             run.iterations.push(it);
             run.stop_note = out.text;
-            return finish(app, &mut run, StopReason::Failed);
+            return finish(&mut run, StopReason::Failed, note);
         }
         run.interventions.clear();
 
@@ -454,19 +484,10 @@ pub async fn start(app: &App, l: &Loop) -> Result<(), String> {
                         iteration: n,
                     });
                     let _ = state::save_run(&run);
-                    app.say(paint(
-                        &app.caps,
-                        Role::Accent,
-                        &format!("цикл спрашивает: {what}"),
-                    ));
-                    app.say(paint(
-                        &app.caps,
-                        Role::Dim,
-                        &format!(
-                            "ответить: jarvis loop say {} <текст>, дальше loop start",
-                            l.name
-                        ),
-                    ));
+                    note(Note::Ask {
+                        name: l.name.clone(),
+                        question: what,
+                    });
                     return Ok(());
                 }
             }
@@ -477,17 +498,21 @@ pub async fn start(app: &App, l: &Loop) -> Result<(), String> {
 
         it.sampled = is_sampled(l.sampling.every, n);
         it.ended_at = now_ms();
-        app.say(render::iteration_row(&app.caps, &it));
+        note(Note::Done(it.clone()));
         run.iterations.push(it);
         let _ = state::save_run(&run);
 
         if run.streak >= l.exit.streak.max(1) {
-            return finish(app, &mut run, StopReason::Exit);
+            return finish(&mut run, StopReason::Exit, note);
         }
     }
 }
 
-fn finish(app: &App, run: &mut Run, reason: StopReason) -> Result<(), String> {
+fn finish(
+    run: &mut Run,
+    reason: StopReason,
+    note: &mut (dyn FnMut(Note) + Send),
+) -> Result<(), String> {
     run.state = if reason == StopReason::Exit {
         RunState::Done
     } else {
@@ -496,30 +521,12 @@ fn finish(app: &App, run: &mut Run, reason: StopReason) -> Result<(), String> {
     run.stop = reason;
     run.ended_at = now_ms();
     let _ = state::save_run(run);
-    println!();
-    let role = if reason == StopReason::Exit {
-        Role::Accent
-    } else {
-        Role::Dim
-    };
-    app.say(paint(
-        &app.caps,
-        role,
-        &format!(
-            "{} · {} итераций · {} токенов",
-            reason.word(),
-            run.iterations.len(),
-            render::fmt_tokens(run.tokens)
-        ),
-    ));
-    let pending = run.pending_review();
-    if pending > 0 {
-        app.say(paint(
-            &app.caps,
-            Role::Accent,
-            &format!("{pending} итераций ждут твоего взгляда — jarvis loop show"),
-        ));
-    }
+    note(Note::Finished {
+        reason,
+        iterations: run.iterations.len(),
+        tokens: run.tokens,
+        pending: run.pending_review(),
+    });
     Ok(())
 }
 

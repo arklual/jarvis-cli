@@ -65,6 +65,8 @@ enum View {
     Chat,
     Screen,
     Loops,
+    /// Журнал одного цикла: итерации и чем кончилось.
+    Loop,
     Bundles,
     /// Пульт одной связки: руки, очередь, действия.
     Bundle,
@@ -230,7 +232,9 @@ struct Ui {
     bundles: Vec<state::Bundle>,
     loops: Vec<state::Loop>,
     disk_at: i64,
-    /// Выбранная связка и выбранная рука в её пульте.
+    /// Выбранные цикл, связка и рука.
+    lsel: usize,
+    open_loop: String,
     bsel: usize,
     hsel: usize,
     open_bundle: String,
@@ -267,6 +271,8 @@ impl Default for Ui {
             bundles: Vec::new(),
             loops: Vec::new(),
             disk_at: 0,
+            lsel: 0,
+            open_loop: String::new(),
             bsel: 0,
             hsel: 0,
             open_bundle: String::new(),
@@ -348,6 +354,11 @@ pub async fn run(app: &App, machine_name: &str) -> Result<(), String> {
                     reg = registry(&client).await.unwrap_or_default();
                     changed = true;
                 }
+                Msg::Loop(n) => {
+                    ui.status = loop_line(n);
+                    // Журнал цикла лежит в файле — перечитаем его к кадру.
+                    ui.disk_at = 0;
+                }
                 Msg::Done(res) => {
                     // Долгое действие закончилось: снимаем занятость и
                     // показываем итог там же, где человек его ждёт.
@@ -384,6 +395,8 @@ enum Msg {
     Gap,
     /// Долгое действие закончилось: что сказать человеку.
     Done(Result<Vec<String>, String>),
+    /// Цикл рассказывает, что с ним происходит.
+    Loop(crate::engine::loops::Note),
 }
 
 /// Отдельная задача: сидит на долгом опросе и складывает события в канал.
@@ -492,6 +505,59 @@ fn palette(ui: &Ui) -> Vec<&'static slash::Command> {
     slash::matching(head)
 }
 
+/// Выбранный цикл: в списке — по курсору, в журнале — открытый.
+fn current_loop(ui: &Ui) -> Option<&state::Loop> {
+    if ui.view == View::Loop {
+        ui.loops.iter().find(|l| l.id == ui.open_loop)
+    } else {
+        ui.loops.get(ui.lsel)
+    }
+}
+
+/// Пометить прогон остановленным — то же, что делает команда.
+fn stop_loop(id: &str) -> Result<(), String> {
+    let Some(mut run) = state::load_run(id) else {
+        return Err("этот цикл не запускался".into());
+    };
+    run.state = state::RunState::Stopped;
+    run.stop = state::StopReason::Stopped;
+    run.stop_note = "остановлен из окна".into();
+    run.ended_at = now_ms();
+    state::save_run(&run).map_err(|e| format!("не записал журнал: {e}"))
+}
+
+/// Ход цикла одной строкой для строки состояния.
+fn loop_line(n: crate::engine::loops::Note) -> String {
+    use crate::engine::loops::Note;
+    match n {
+        Note::Head { branch, .. } => format!("прогон в {branch}"),
+        Note::Started(i) => format!("итерация {i} — пошла"),
+        Note::Done(it) => format!(
+            "итерация {} — {}",
+            it.n,
+            match it.verdict {
+                state::Verdict::Passed => "прошла",
+                state::Verdict::Returned => "возврат критика",
+                state::Verdict::GateFailed => "красный гейт",
+                state::Verdict::Failed => "сорвалась",
+                state::Verdict::Running => "идёт",
+            }
+        ),
+        Note::Ask { question, .. } => format!("цикл спрашивает: {question}"),
+        Note::Finished {
+            reason,
+            iterations,
+            tokens,
+            ..
+        } => format!(
+            "{} · {} · {} токенов",
+            reason.word(),
+            crate::core::util::plural(iterations as u64, "итерация", "итерации", "итераций"),
+            render::fmt_tokens(tokens)
+        ),
+    }
+}
+
 /// Открытая сейчас связка.
 fn current_bundle(ui: &Ui) -> Option<&state::Bundle> {
     ui.bundles.iter().find(|b| b.id == ui.open_bundle)
@@ -551,6 +617,7 @@ async fn handle(
         Act::Up => match ui.view {
             View::List => ui.sel = ui.sel.saturating_sub(1),
             View::Chat => ui.scroll += 1,
+            View::Loops => ui.lsel = ui.lsel.saturating_sub(1),
             View::Bundles => ui.bsel = ui.bsel.saturating_sub(1),
             View::Bundle => ui.hsel = ui.hsel.saturating_sub(1),
             _ => {}
@@ -558,6 +625,7 @@ async fn handle(
         Act::Down => match ui.view {
             View::List => ui.sel = (ui.sel + 1).min(list.len().saturating_sub(1)),
             View::Chat => ui.scroll = ui.scroll.saturating_sub(1),
+            View::Loops => ui.lsel = (ui.lsel + 1).min(ui.loops.len().saturating_sub(1)),
             View::Bundles => {
                 ui.bsel = (ui.bsel + 1).min(ui.bundles.len().saturating_sub(1));
             }
@@ -569,6 +637,15 @@ async fn handle(
         },
         Act::PageUp => ui.scroll += 10,
         Act::PageDown => ui.scroll = ui.scroll.saturating_sub(10),
+        Act::Open if ui.view == View::Loops => {
+            let Some(l) = ui.loops.get(ui.lsel).cloned() else {
+                ui.status = "циклов пока нет — n заведёт".into();
+                return true;
+            };
+            ui.open_loop = l.id;
+            ui.view = View::Loop;
+            ui.status.clear();
+        }
         Act::Open if ui.view == View::Bundles => {
             let Some(b) = ui.bundles.get(ui.bsel).cloned() else {
                 ui.status = "связок пока нет — заведи: jarvis bundle new".into();
@@ -635,6 +712,52 @@ async fn handle(
                 },
                 _ => ui.status = "у сессии ещё нет транскрипта".into(),
             }
+        }
+        Act::Screen if matches!(ui.view, View::Loops | View::Loop) => {
+            let Some(l) = current_loop(ui).cloned() else {
+                ui.status = "циклов пока нет — n заведёт".into();
+                return true;
+            };
+            if ui.busy.is_some() {
+                ui.status = "погоди, прошлое действие ещё идёт".into();
+                return true;
+            }
+            let problems = l.problems();
+            if !problems.is_empty() {
+                // Цикл без цели или без стен не запускаем: он будет крутиться
+                // непонятно за чем и остановится непонятно когда.
+                ui.status = problems.join(" · ");
+                return true;
+            }
+            ui.busy = Some(format!("цикл {}", l.name));
+            ui.status = format!("{}: прогон пошёл", l.name);
+            ui.open_loop = l.id.clone();
+            ui.view = View::Loop;
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                let tx3 = tx2.clone();
+                let mut note = move |n| {
+                    // Отчёт не должен ждать: очередь полна — переживём, ход
+                    // всё равно лежит в журнале.
+                    let _ = tx3.try_send(Msg::Loop(n));
+                };
+                let res = crate::engine::loops::start(&l, &mut note)
+                    .await
+                    .map(|_| vec![format!("цикл «{}» отработал", l.name)]);
+                let _ = tx2.send(Msg::Done(res)).await;
+            });
+        }
+        Act::Interrupt if matches!(ui.view, View::Loops | View::Loop) => {
+            let Some(l) = current_loop(ui).cloned() else {
+                return true;
+            };
+            // Останавливаем через журнал: движок спрашивает его перед каждой
+            // итерацией, и так же это делает команда `jarvis loop stop`.
+            ui.status = match stop_loop(&l.id) {
+                Ok(_) => format!("{}: остановится после текущей итерации", l.name),
+                Err(e) => e,
+            };
+            ui.disk_at = 0;
         }
         Act::Screen => {
             let Some(s) = cur else { return true };
@@ -1191,6 +1314,15 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
         View::Chat => (format!("{} · чат", ui.open_title), machine.to_string()),
         View::Screen => (format!("{} · экран", ui.open_title), machine.to_string()),
         View::Loops => ("Циклы".into(), machine.to_string()),
+        View::Loop => {
+            let l = current_loop(ui);
+            let name = l.map(|l| l.name.clone()).unwrap_or_default();
+            let right = l
+                .and_then(|l| state::load_run(&l.id))
+                .map(|r| format!("{} · {} итераций", r.stop.word(), r.iterations.len()))
+                .unwrap_or_else(|| "не запускался".into());
+            (format!("цикл · {name}"), right)
+        }
         View::Bundles => ("Связки".into(), machine.to_string()),
         View::Bundle => {
             let b = current_bundle(ui);
@@ -1238,6 +1370,7 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
                 }
             }
             View::Loops => draw_loops(&mut out, caps, ui, body),
+            View::Loop => draw_loop(&mut out, caps, ui, body),
             View::Bundles => draw_bundles(&mut out, caps, ui, body),
             View::Bundle => draw_bundle(&mut out, caps, ui, body),
             View::Help => draw_help(&mut out, caps),
@@ -1391,7 +1524,20 @@ fn keys_hint(caps: &Caps, ui: &Ui) -> String {
             ("p", "пауза"),
             ("esc", "назад"),
         ],
-        View::Loops => vec![("n", "новый цикл"), ("esc", "назад"), ("q", "выход")],
+        View::Loops => vec![
+            ("↑↓", "выбор"),
+            ("↵", "журнал"),
+            ("s", "запустить"),
+            ("x", "остановить"),
+            ("n", "новый"),
+            ("esc", "назад"),
+        ],
+        View::Loop => vec![
+            ("s", "запустить"),
+            ("x", "остановить"),
+            ("esc", "назад"),
+            ("q", "выход"),
+        ],
         View::Screen | View::Help => {
             vec![("esc", "назад"), ("q", "выход")]
         }
@@ -1468,7 +1614,7 @@ fn draw_loops(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
     if all.is_empty() {
         push(
             out,
-            &paint(caps, Role::Dim, "Циклов пока нет. Завести: jarvis loop new"),
+            &paint(caps, Role::Muted, " Циклов пока нет. n — завести цикл."),
         );
         return;
     }
@@ -1478,15 +1624,77 @@ fn draw_loops(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
         .max()
         .unwrap_or(10)
         .clamp(8, 24);
+    let total = caps.width as usize;
+    let inner = Caps {
+        width: total.saturating_sub(2) as u16,
+        ..*caps
+    };
+    for (i, l) in all.iter().enumerate().take(rows) {
+        let run = state::load_run(&l.id);
+        let row = render::loop_row(&inner, l, run.as_ref(), col);
+        if i == ui.lsel {
+            push(out, &band(caps, Bg::Sel, &row, total));
+        } else {
+            push(out, &format!(" {row}"));
+        }
+    }
+}
+
+/// Журнал цикла: итерации сверху вниз, свежие внизу — как в разговоре.
+fn draw_loop(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
+    let Some(l) = current_loop(ui) else {
+        push(out, &paint(caps, Role::Muted, " цикл пропал"));
+        return;
+    };
+    push(
+        out,
+        &paint(
+            caps,
+            Role::Dim,
+            &format!(
+                " {} · {} · выход: {} подряд",
+                l.sandbox.repo,
+                l.wake_label(),
+                l.exit.streak
+            ),
+        ),
+    );
+    push(
+        out,
+        &paint(caps, Role::Muted, &format!(" цель: {}", l.source.goal)),
+    );
+    push(out, "");
+    let Some(run) = state::load_run(&l.id) else {
+        push(
+            out,
+            &paint(caps, Role::Muted, " Ещё не запускался. s — запустить."),
+        );
+        return;
+    };
+    if run.iterations.is_empty() {
+        push(out, &paint(caps, Role::Muted, " Итераций пока нет."));
+    }
     let inner = Caps {
         width: (caps.width as usize).saturating_sub(2) as u16,
         ..*caps
     };
-    for l in all.iter().take(rows) {
-        let run = state::load_run(&l.id);
+    // Свежие итерации внизу: журнал читается как разговор, а не как архив.
+    for it in visible(&run.iterations, rows.saturating_sub(5), 0) {
+        push(out, &render::iteration_row(&inner, it));
+    }
+    if let Some(ask) = run.ask.as_ref() {
+        push(out, "");
         push(
             out,
-            &format!(" {}", render::loop_row(&inner, l, run.as_ref(), col)),
+            &paint(caps, Role::Warn, &format!(" спрашивает: {}", ask.question)),
+        );
+        push(
+            out,
+            &paint(
+                caps,
+                Role::Dim,
+                &format!(" ответить: jarvis loop say {} <текст>", l.name),
+            ),
         );
     }
 }
@@ -1872,6 +2080,31 @@ mod tests {
         assert_eq!(plain, "раз !два", "каретка съела букву: {plain:?}");
         // Обратным цветом помечен ровно один символ — тот, что под курсором.
         assert!(line.contains("\x1b[7mд\x1b[27m"), "{line:?}");
+    }
+
+    /// Ход цикла виден в строке состояния: без этого запуск из окна выглядит
+    /// как «нажал и ничего не произошло».
+    #[test]
+    fn loop_progress_reads_like_a_sentence() {
+        use crate::engine::loops::Note;
+        assert_eq!(loop_line(Note::Started(3)), "итерация 3 — пошла");
+        let it = state::Iteration {
+            n: 2,
+            verdict: state::Verdict::GateFailed,
+            ..Default::default()
+        };
+        assert_eq!(loop_line(Note::Done(it)), "итерация 2 — красный гейт");
+        let done = loop_line(Note::Finished {
+            reason: state::StopReason::Exit,
+            iterations: 1,
+            tokens: 90_000,
+            pending: 0,
+        });
+        assert!(
+            done.contains("1 итерация"),
+            "числительное не согласовано: {done}"
+        );
+        assert!(done.contains("90k"));
     }
 
     /// Связка должна заводиться НЕ выходя из окна: раньше пустой список
