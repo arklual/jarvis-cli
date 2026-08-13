@@ -54,8 +54,9 @@ const BUNDLE_STEPS: [Step; 4] = [Step::Dir, Step::Name, Step::Base, Step::Gates]
 const LOOP_STEPS: [Step; 5] = [Step::Dir, Step::Name, Step::Goal, Step::Source, Step::Gates];
 
 impl Form {
-    /// Новая форма связки: каталог, откуда запущено окно, — самый вероятный
-    /// ответ.
+    /// Новая форма связки. Каталог передаёт вызывающий: на этой машине это
+    /// каталог запуска, на удалённой — её домашний, и знать разницу форме
+    /// незачем.
     pub fn new(cwd: &str) -> Self {
         Self {
             kind: Kind::Bundle,
@@ -191,14 +192,15 @@ impl Form {
         out
     }
 
-    /// Готовый цикл. Всё, чего не спрашивали, — умолчания: критик включён,
+    /// Готовый цикл на выбранной машине., — умолчания: критик включён,
     /// стены на месте, будильник ручной. Цикл, который проснётся сам в первую
     /// же ночь после заведения, — не то, чего ждут от пяти вопросов.
-    pub fn build_loop(&self) -> Loop {
+    pub fn build_loop(&self, machine: &str) -> Loop {
         let mut l = Loop {
             id: format!("loop-{}", now_ms()),
             name: self.name.clone(),
             agent: "claude".into(),
+            machine: machine.to_string(),
             sandbox: Sandbox {
                 repo: self.dir.clone(),
                 ..Default::default()
@@ -358,7 +360,8 @@ mod tests {
         f.accept("");
         assert!(f.accept("1"));
 
-        let l = f.build_loop();
+        let l = f.build_loop("vps");
+        assert_eq!(l.machine, "vps", "цикл обязан помнить, где ему крутиться");
         assert_eq!(l.name, "ночной обход");
         assert_eq!(l.sandbox.repo, "/srv/proj");
         assert_eq!(l.source.goal, "чинить красные тесты");

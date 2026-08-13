@@ -443,10 +443,32 @@ fn toggle_pause(id: &str, on: bool) -> Result<(), String> {
 }
 
 /// Завести связку: спрашиваем по одному вопросу в той же строке ввода.
-fn start_form(ui: &mut Ui, kind: Kind) {
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| ".".into());
+async fn start_form(ui: &mut Ui, kind: Kind) {
+    // Каталог по умолчанию спрашиваем у той машины, где будем работать: на
+    // сервере путь этого компьютера бессмыслен, а «./» бессмыслен вдвойне.
+    let cwd = match machine::find(&ui.machine) {
+        Ok(m) if m.is_local() => std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".into()),
+        Ok(m) => {
+            let (code, home) = machine::run(
+                &m,
+                "/",
+                "printf %s \"$HOME\"",
+                std::time::Duration::from_secs(15),
+            )
+            .await;
+            if code == 0 && !home.trim().is_empty() {
+                home.trim().to_string()
+            } else {
+                "~".into()
+            }
+        }
+        Err(e) => {
+            ui.status = e;
+            return;
+        }
+    };
     ui.form = Some(match kind {
         Kind::Bundle => Form::new(&cwd),
         Kind::Loop => Form::new_loop(&cwd),
@@ -841,7 +863,7 @@ async fn handle(
                     }
                 }
                 Kind::Loop => {
-                    let l = form.build_loop();
+                    let l = form.build_loop(&ui.machine);
                     let mut all = state::load_loops();
                     all.push(l.clone());
                     match state::save_loops(&all) {
@@ -1004,8 +1026,8 @@ async fn handle(
                 Err(e) => ui.status = e,
             }
         }
-        Act::NewHand if ui.view == View::Bundles => start_form(ui, Kind::Bundle),
-        Act::NewHand if ui.view == View::Loops => start_form(ui, Kind::Loop),
+        Act::NewHand if ui.view == View::Bundles => start_form(ui, Kind::Bundle).await,
+        Act::NewHand if ui.view == View::Loops => start_form(ui, Kind::Loop).await,
         Act::NewHand => {
             if ui.view != View::Bundle {
                 ui.status = "новая связка — в списке связок (b), новая рука — в пульте".into();
@@ -1096,7 +1118,7 @@ async fn run_slash(
             } else {
                 View::Bundles
             };
-            start_form(ui, kind);
+            start_form(ui, kind).await;
         }
         "limits" => {
             ui.limits_at = 0; // следующий круг перечитает
@@ -1319,7 +1341,18 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
             let name = l.map(|l| l.name.clone()).unwrap_or_default();
             let right = l
                 .and_then(|l| state::load_run(&l.id))
-                .map(|r| format!("{} · {} итераций", r.stop.word(), r.iterations.len()))
+                .map(|r| {
+                    format!(
+                        "{} · {}",
+                        r.stop.word(),
+                        crate::core::util::plural(
+                            r.iterations.len() as u64,
+                            "итерация",
+                            "итерации",
+                            "итераций"
+                        )
+                    )
+                })
                 .unwrap_or_else(|| "не запускался".into());
             (format!("цикл · {name}"), right)
         }
@@ -1652,7 +1685,12 @@ fn draw_loop(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
             caps,
             Role::Dim,
             &format!(
-                " {} · {} · выход: {} подряд",
+                " {}{} · {} · выход: {} подряд",
+                if l.machine.is_empty() || l.machine == "local" {
+                    String::new()
+                } else {
+                    format!("{}:", l.machine)
+                },
                 l.sandbox.repo,
                 l.wake_label(),
                 l.exit.streak

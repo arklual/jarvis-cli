@@ -47,6 +47,40 @@ pub fn list() -> Vec<Machine> {
     out
 }
 
+/// Машина по имени. Пустое имя — локальная: цикл, заведённый до появления
+/// удалённых, обязан продолжать работать.
+pub fn find(name: &str) -> Result<Machine, String> {
+    let n = if name.trim().is_empty() {
+        "local"
+    } else {
+        name.trim()
+    };
+    let all = list();
+    all.iter().find(|m| m.name == n).cloned().ok_or_else(|| {
+        let names: Vec<&str> = all.iter().map(|m| m.name.as_str()).collect();
+        format!("нет машины «{n}». Есть: {}", names.join(", "))
+    })
+}
+
+/// Каталог данных Jarvis ТОЙ машины: `~` раскрывает она сама.
+pub async fn data_dir(m: &Machine) -> Result<String, String> {
+    if m.is_local() {
+        return Ok(jarvis_dir().to_string_lossy().into_owned());
+    }
+    if !m.dir.starts_with('~') {
+        return Ok(m.dir.clone());
+    }
+    let (code, home) = run(m, "/", "printf %s \"$HOME\"", Duration::from_secs(15)).await;
+    if code != 0 || home.trim().is_empty() {
+        return Err(format!(
+            "не узнал $HOME машины «{}»: {}",
+            m.name,
+            home.trim()
+        ));
+    }
+    Ok(m.dir.replacen('~', home.trim(), 1))
+}
+
 /// Записать машину в `settings.json`, не тронув остальное.
 ///
 /// Файл общий с панелью, и в нём живут чужие ключи — от размеров окна до
@@ -396,6 +430,28 @@ pub async fn run(m: &Machine, cwd: &str, cmd: &str, timeout: Duration) -> (i32, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Пустое имя — локальная машина: циклы и связки, заведённые до появления
+    /// удалённых, обязаны продолжать работать.
+    #[test]
+    fn an_empty_name_means_this_computer() {
+        assert!(find("").unwrap().is_local());
+        assert!(find("local").unwrap().is_local());
+        let err = find("нетакой").unwrap_err();
+        assert!(err.contains("Есть: local"), "{err}");
+    }
+
+    /// Каталог данных удалённой машины, заданный абсолютным путём, спрашивать
+    /// не у кого — он уже полный.
+    #[tokio::test]
+    async fn absolute_remote_data_dir_needs_no_ssh() {
+        let m = Machine {
+            name: "vps".into(),
+            ssh_host: "me@vps".into(),
+            dir: "/srv/jarvis".into(),
+        };
+        assert_eq!(data_dir(&m).await.unwrap(), "/srv/jarvis");
+    }
 
     /// Ошибка ssh должна называть причину и следующее действие. «Не узнал
     /// $HOME» на запрет по ключу отправляло чинить не то — и не помогало.

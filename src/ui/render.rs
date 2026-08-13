@@ -182,6 +182,10 @@ pub fn loop_row(caps: &Caps, l: &Loop, run: Option<&Run>, name_col: usize) -> St
         _ => "idle",
     };
     let mut tail = vec![paint(caps, Role::Dim, &l.wake_label())];
+    // Машина в строке только когда она не эта: «local» у каждого цикла — шум.
+    if !l.machine.trim().is_empty() && l.machine != "local" {
+        tail.push(paint(caps, Role::Accent, &l.machine));
+    }
     if waiting > 0 {
         tail.push(paint(
             caps,

@@ -7,9 +7,9 @@
 //! Отличие терминала от панели одно, и оно в его пользу: человек видит ход
 //! прямо в потоке вывода, а не в журнале постфактум.
 
+use crate::core::machine::{self, Machine};
 use crate::core::state::{self, GateRun, Iteration, Loop, Run, RunState, StopReason, Verdict};
 use crate::core::util::{ellipsize, now_ms, one_line, shell_quote};
-use std::process::Stdio;
 use std::time::Duration;
 
 const ITERATION: Duration = Duration::from_secs(3600);
@@ -216,28 +216,18 @@ fn critic_prompt(l: &Loop, summary: &str, diff: &str) -> String {
 
 /* ---------- исполнение ---------- */
 
-async fn sh(cwd: &str, cmd: &str, timeout: Duration) -> (i32, String) {
-    let mut c = tokio::process::Command::new("/bin/sh");
-    c.arg("-lc")
-        .arg(cmd)
-        .current_dir(cwd)
-        .env("JARVIS_IGNORE", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let Ok(Ok(out)) = tokio::time::timeout(timeout, c.output()).await else {
-        return (-1, format!("не уложилось в {} с", timeout.as_secs()));
-    };
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let err = String::from_utf8_lossy(&out.stderr);
-    if !err.trim().is_empty() {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(err.trim_end());
-    }
-    (out.status.code().unwrap_or(-1), text)
+/// Команда цикла — всегда через машину, даже локальную.
+///
+/// Один путь на оба случая: то, что цикл крутится на сервере, не должно быть
+/// отдельным режимом с отдельными ошибками. `JARVIS_IGNORE` объявляем внутри
+/// команды, а не переменной окружения процесса: по ssh окружение не уедет.
+async fn sh(m: &Machine, cwd: &str, cmd: &str, timeout: Duration) -> (i32, String) {
+    machine::run(m, cwd, &ignored(cmd), timeout).await
+}
+
+/// Пометить команду как «не считать работой агента».
+pub fn ignored(cmd: &str) -> String {
+    format!("export JARVIS_IGNORE=1\n{cmd}")
 }
 
 pub fn tail(text: &str, lines: usize) -> String {
@@ -245,46 +235,55 @@ pub fn tail(text: &str, lines: usize) -> String {
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
-async fn run_agent(cwd: &str, prompt: &str, model: Option<&str>, timeout: Duration) -> AgentOut {
-    let mut c = tokio::process::Command::new("claude");
-    c.arg("-p")
-        .arg(prompt)
-        .arg("--output-format")
-        .arg("json")
-        // Цикл работает в своей песочнице и без человека: спрашивать
-        // разрешения не у кого, а остановка на вопросе означала бы запуск,
-        // висящий до утра.
-        .arg("--dangerously-skip-permissions");
+/// Команда headless-вызова агента.
+///
+/// Отдельной функцией, потому что она уезжает на чужую машину строкой: там нет
+/// ни нашего окружения, ни нашей кавычки. Stderr гасим прямо в команде —
+/// удалённый запуск склеивает потоки, а к JSON агента чужая строка не
+/// прилипнет только так.
+pub fn agent_cmd(prompt: &str, model: Option<&str>) -> String {
+    let mut cmd = format!(
+        "claude -p {} --output-format json --dangerously-skip-permissions",
+        shell_quote(prompt)
+    );
     if let Some(m) = model {
-        c.arg("--model").arg(m);
+        cmd.push_str(&format!(" --model {}", shell_quote(m)));
     }
-    c.current_dir(cwd)
-        .env("JARVIS_IGNORE", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let Ok(Ok(out)) = tokio::time::timeout(timeout, c.output()).await else {
+    // Цикл работает в песочнице и без человека: спрашивать разрешения не у
+    // кого, а остановка на вопросе означала бы запуск, висящий до утра.
+    cmd.push_str(" 2>/dev/null");
+    cmd
+}
+
+async fn run_agent(
+    m: &Machine,
+    cwd: &str,
+    prompt: &str,
+    model: Option<&str>,
+    timeout: Duration,
+) -> AgentOut {
+    let (code, out) = sh(m, cwd, &agent_cmd(prompt, model), timeout).await;
+    if code == -1 {
         return AgentOut {
             failed: true,
             text: "агент не уложился в отведённое время".into(),
             ..Default::default()
         };
-    };
-    if !out.status.success() {
+    }
+    if code != 0 {
         return AgentOut {
             failed: true,
             text: "агент завершился с ошибкой".into(),
             ..Default::default()
         };
     }
-    parse_agent_json(&String::from_utf8_lossy(&out.stdout))
+    parse_agent_json(&out)
 }
 
-async fn run_gates(gates: &[state::Gate], cwd: &str) -> Vec<GateRun> {
+async fn run_gates(m: &Machine, gates: &[state::Gate], cwd: &str) -> Vec<GateRun> {
     let mut out = Vec::new();
     for g in gates {
-        let (code, text) = sh(cwd, &g.command, GATE).await;
+        let (code, text) = sh(m, cwd, &g.command, GATE).await;
         let ok = code == 0;
         out.push(GateRun {
             name: g.name.clone(),
@@ -299,10 +298,26 @@ async fn run_gates(gates: &[state::Gate], cwd: &str) -> Vec<GateRun> {
 }
 
 /// Поднять песочницу: отдельный worktree на своей ветке.
-async fn make_sandbox(l: &Loop, run_n: u32) -> Result<(String, String), String> {
+async fn make_sandbox(m: &Machine, l: &Loop, run_n: u32) -> Result<(String, String), String> {
     let repo = l.sandbox.repo.trim().to_string();
-    if !std::path::Path::new(&repo).join(".git").exists() {
-        return Err(format!("{repo} — не репозиторий git"));
+    // Про чужую машину «есть ли .git» знает только она сама.
+    let (code, why) = sh(
+        m,
+        "/",
+        &format!("test -d {}/.git", shell_quote(&repo)),
+        Duration::from_secs(20),
+    )
+    .await;
+    if code != 0 {
+        // `test -d` молчит, поэтому любой вывод здесь — жалоба транспорта.
+        // Без этого различия человек читает «не репозиторий git» и идёт
+        // проверять путь, хотя ssh просто не пустил.
+        let why = one_line(why.trim());
+        return Err(if why.is_empty() {
+            format!("{repo} — не репозиторий git (на {})", m.name)
+        } else {
+            format!("не добрался до «{}»: {why}", m.name)
+        });
     }
     let branch = l
         .sandbox
@@ -312,12 +327,17 @@ async fn make_sandbox(l: &Loop, run_n: u32) -> Result<(String, String), String> 
     if !l.sandbox.worktree {
         return Ok((repo, branch));
     }
-    let dir = crate::core::util::jarvis_dir()
-        .join("worktrees")
-        .join(format!("{}-{run_n}", slug(&l.name)))
-        .to_string_lossy()
-        .into_owned();
-    if std::path::Path::new(&dir).exists() {
+    // Песочница живёт в каталоге данных ТОЙ машины, где крутится цикл.
+    let root = machine::data_dir(m).await?;
+    let dir = format!("{root}/worktrees/{}-{run_n}", slug(&l.name));
+    let (exists, _) = sh(
+        m,
+        "/",
+        &format!("test -d {}", shell_quote(&dir)),
+        Duration::from_secs(20),
+    )
+    .await;
+    if exists == 0 {
         return Ok((dir, branch)); // продолжаем прежний запуск, а не падаем
     }
     let cmd = format!(
@@ -325,7 +345,7 @@ async fn make_sandbox(l: &Loop, run_n: u32) -> Result<(String, String), String> 
         shell_quote(&branch),
         shell_quote(&dir)
     );
-    let (code, out) = sh(&repo, &cmd, Duration::from_secs(120)).await;
+    let (code, out) = sh(m, &repo, &cmd, Duration::from_secs(120)).await;
     if code != 0 {
         return Err(format!("git worktree: {}", tail(&out, 4)));
     }
@@ -355,8 +375,10 @@ pub fn slug(name: &str) -> String {
 
 /// Прогнать цикл, показывая ход прямо в терминале.
 pub async fn start(l: &Loop, note: &mut (dyn FnMut(Note) + Send)) -> Result<(), String> {
+    // Машину берём по имени из самого цикла: где заведён, там и крутится.
+    let m = machine::find(&l.machine)?;
     let run_n = state::load_run(&l.id).map(|r| r.n + 1).unwrap_or(1);
-    let (dir, branch) = make_sandbox(l, run_n).await?;
+    let (dir, branch) = make_sandbox(&m, l, run_n).await?;
 
     note(Note::Head {
         name: l.name.clone(),
@@ -401,7 +423,7 @@ pub async fn start(l: &Loop, note: &mut (dyn FnMut(Note) + Send)) -> Result<(), 
         let tasks = if l.source.command.trim().is_empty() {
             String::new()
         } else {
-            let (_, out) = sh(&dir, &l.source.command, Duration::from_secs(300)).await;
+            let (_, out) = sh(&m, &dir, &l.source.command, Duration::from_secs(300)).await;
             tail(&out, 40)
         };
         let notes = if l.memory.enabled {
@@ -414,6 +436,7 @@ pub async fn start(l: &Loop, note: &mut (dyn FnMut(Note) + Send)) -> Result<(), 
 
         note(Note::Started(n));
         let out = run_agent(
+            &m,
             &dir,
             &iteration_prompt(l, &run, &tasks, &notes, &last_return),
             None,
@@ -434,7 +457,7 @@ pub async fn start(l: &Loop, note: &mut (dyn FnMut(Note) + Send)) -> Result<(), 
         }
         run.interventions.clear();
 
-        it.gates = run_gates(&l.exit.gates, &dir).await;
+        it.gates = run_gates(&m, &l.exit.gates, &dir).await;
         if !it.gates.iter().all(|g| g.ok) {
             it.verdict = Verdict::GateFailed;
             last_return = it
@@ -445,8 +468,15 @@ pub async fn start(l: &Loop, note: &mut (dyn FnMut(Note) + Send)) -> Result<(), 
                 .unwrap_or_default();
             run.streak = 0;
         } else if l.exit.critic.enabled {
-            let (_, diff) = sh(&dir, "git --no-pager diff HEAD", Duration::from_secs(60)).await;
+            let (_, diff) = sh(
+                &m,
+                &dir,
+                "git --no-pager diff HEAD",
+                Duration::from_secs(60),
+            )
+            .await;
             let verdict = run_agent(
+                &m,
                 &dir,
                 &critic_prompt(l, &it.summary, &ellipsize(&diff, DIFF_FOR_CRITIC)),
                 Some(&l.exit.critic.model)
@@ -533,6 +563,37 @@ fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Команда агента уезжает на чужую машину СТРОКОЙ: там нет ни нашего
+    /// окружения, ни нашей кавычки. Промт с кавычками и переводами строк
+    /// обязан доехать целым.
+    #[test]
+    fn agent_command_survives_a_hostile_prompt() {
+        let prompt = "сделай так:\n  echo 'привет' && ls $HOME `date`";
+        let cmd = agent_cmd(prompt, Some("opus"));
+        assert!(cmd.starts_with("claude -p '"));
+        assert!(cmd.contains("--output-format json"));
+        assert!(cmd.contains("--dangerously-skip-permissions"));
+        assert!(cmd.contains("--model 'opus'"));
+        // Stderr гасим прямо в команде: удалённый запуск склеивает потоки, и
+        // чужая строка прилипла бы к JSON агента.
+        assert!(cmd.ends_with("2>/dev/null"));
+        // Ни одна опасная часть промта не осталась вне кавычек.
+        for danger in ["&&", "$HOME", "`date`"] {
+            let at = cmd.find(danger).expect(danger);
+            let quoted = cmd[..at].matches('\'').count() % 2 == 1;
+            assert!(quoted, "«{danger}» вылезло из кавычек: {cmd}");
+        }
+    }
+
+    /// Пометка «не считать это работой агента» должна пережить составную
+    /// команду: `JARVIS_IGNORE=1 a; b` пометил бы только `a`.
+    #[test]
+    fn ignore_mark_covers_the_whole_command() {
+        let c = ignored("make test; make lint");
+        assert!(c.starts_with("export JARVIS_IGNORE=1\n"));
+        assert!(c.ends_with("make test; make lint"));
+    }
 
     #[test]
     fn agent_json_gives_text_and_real_spend() {
@@ -638,7 +699,7 @@ mod tests {
                 command: "true".into(),
             },
         ];
-        let runs = run_gates(&gates, "/tmp").await;
+        let runs = run_gates(&Machine::local(), &gates, "/tmp").await;
         assert_eq!(runs.len(), 2);
         assert!(runs[0].ok && !runs[1].ok);
     }

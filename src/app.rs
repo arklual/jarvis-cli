@@ -133,7 +133,7 @@ pub async fn run(parsed: Parsed) -> Result<(), String> {
         Cmd::Control { session, cmd } => cmd_control(&app, &parsed.machine, &session, &cmd).await,
         Cmd::Run { dir, agent } => cmd_run(&app, &parsed.machine, &dir, &agent).await,
         Cmd::Limits { fresh } => cmd_limits(&app, &parsed.machine, fresh).await,
-        Cmd::Loop { action } => cmd_loop(&app, action).await,
+        Cmd::Loop { action } => cmd_loop(&app, &parsed.machine, action).await,
         Cmd::Bundle { action } => cmd_bundle(&app, &parsed.machine, action).await,
         Cmd::Notify { once } => crate::ui::watch::notify(&app, &parsed.machine, once).await,
     }
@@ -611,16 +611,39 @@ fn find_loop(id: &str) -> Result<state::Loop, String> {
         })
 }
 
-async fn cmd_loop(app: &App, action: LoopAction) -> Result<(), String> {
+/// Каталог по умолчанию для конструктора: здесь — откуда запущено, на узле —
+/// его домашний. Путь этого компьютера на чужой машине бессмыслен.
+async fn default_dir(machine_name: &str) -> String {
+    let Ok(m) = machine::find(machine_name) else {
+        return ".".into();
+    };
+    if m.is_local() {
+        return std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".into());
+    }
+    let (code, home) = machine::run(
+        &m,
+        "/",
+        "printf %s \"$HOME\"",
+        std::time::Duration::from_secs(15),
+    )
+    .await;
+    if code == 0 && !home.trim().is_empty() {
+        home.trim().to_string()
+    } else {
+        "~".into()
+    }
+}
+
+async fn cmd_loop(app: &App, machine_name: &str, action: LoopAction) -> Result<(), String> {
     match action {
         LoopAction::New => {
             if !prompt::interactive() {
                 return Err("конструктор спрашивает — запусти его в терминале, не в пайпе".into());
             }
-            let cwd = std::env::current_dir()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| ".".into());
-            let l = builder::new_loop(&app.caps, &cwd)?;
+            let cwd = default_dir(machine_name).await;
+            let l = builder::new_loop(&app.caps, &cwd, machine_name)?;
             println!();
             for line in builder::summary(&app.caps, &l) {
                 app.say(line);
@@ -721,7 +744,12 @@ async fn cmd_loop(app: &App, action: LoopAction) -> Result<(), String> {
             let run = state::load_run(&l.id);
             app.say(rule(&app.caps, &l.name));
             app.dim(&format!(
-                "{} · {} · выход: {} подряд",
+                "{}{} · {} · выход: {} подряд",
+                if l.machine.is_empty() || l.machine == "local" {
+                    String::new()
+                } else {
+                    format!("{}:", l.machine)
+                },
                 l.sandbox.repo,
                 l.wake_label(),
                 l.exit.streak
@@ -888,9 +916,7 @@ async fn cmd_bundle(app: &App, machine: &str, action: BundleAction) -> Result<()
             if !prompt::interactive() {
                 return Err("конструктор спрашивает — запусти его в терминале, не в пайпе".into());
             }
-            let cwd = std::env::current_dir()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| ".".into());
+            let cwd = default_dir(machine).await;
             let b = builder::new_bundle(&app.caps, &cwd, machine)?;
             let mut all = state::load_bundles();
             all.push(b.clone());

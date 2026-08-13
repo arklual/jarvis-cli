@@ -147,7 +147,7 @@ pub fn choices(items: &[presets::Preset]) -> Vec<Choice> {
 }
 
 /// Диалог нового цикла. Возвращает готовый к сохранению цикл.
-pub fn new_loop(caps: &Caps, cwd: &str) -> Result<Loop, String> {
+pub fn new_loop(caps: &Caps, cwd: &str, machine: &str) -> Result<Loop, String> {
     println!("{}", rule(caps, "Новый цикл"));
     println!(
         "{}",
@@ -217,6 +217,7 @@ pub fn new_loop(caps: &Caps, cwd: &str) -> Result<Loop, String> {
         id: format!("loop-{}", now_ms()),
         name,
         agent: "claude".into(),
+        machine: machine.to_string(),
         sandbox: Sandbox {
             repo: dir,
             ..Default::default()

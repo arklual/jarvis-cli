@@ -166,6 +166,12 @@ pub struct Loop {
     pub id: String,
     pub name: String,
     pub agent: String,
+    /// Где крутить: пусто или `local` — здесь, иначе имя узла из настроек.
+    ///
+    /// Поля нет у настольной версии: она про него не знает и такой цикл
+    /// запустит у себя. Пока это цена за то, чтобы цикл вообще можно было
+    /// крутить на сервере — там, где живут проекты.
+    pub machine: String,
     pub source: Source,
     pub sandbox: Sandbox,
     pub exit: Exit,
@@ -560,6 +566,20 @@ pub fn save_bundles(items: &[Bundle]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Файл общий с панелью, а поля «машина» у неё нет: старый цикл обязан
+    /// читаться как локальный, а не ломать разбор.
+    #[test]
+    fn a_loop_without_a_machine_is_local() {
+        let old = r#"[{"id":"l1","name":"ночной","sandbox":{"repo":"/srv/p"}}]"#;
+        let loops: Vec<Loop> = serde_json::from_str(old).unwrap();
+        assert_eq!(loops[0].machine, "", "пустое — значит здесь");
+        // И обратно: наш цикл с машиной пишется полем machine.
+        let mut l = loops[0].clone();
+        l.machine = "vps".into();
+        let text = serde_json::to_string(&[l]).unwrap();
+        assert!(text.contains(r#""machine":"vps""#), "{text}");
+    }
 
     fn scoped(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("jcli-state-{tag}-{}", std::process::id()));
