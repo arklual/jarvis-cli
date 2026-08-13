@@ -13,6 +13,7 @@ mod ui;
 use ui::style::{paint, Caps, Role};
 
 fn main() {
+    restore_sigpipe();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let parsed = match cli::parse(&args) {
         Ok(p) => p,
@@ -40,6 +41,20 @@ fn main() {
     if let Err(e) = rt.block_on(app::run(parsed)) {
         fail(&e);
         std::process::exit(1);
+    }
+}
+
+/// Вернуть SIGPIPE поведение по умолчанию.
+///
+/// Rust глушит этот сигнал, и запись в закрытую трубу становится ошибкой:
+/// `jarvis ls | head` заканчивался паникой «failed printing to stdout». Для
+/// программы, которую зовут из шелла, это не мелочь — пайп в `head`, `grep` и
+/// `less` и есть обычный способ ею пользоваться.
+fn restore_sigpipe() {
+    // SAFETY: установка обработчика сигнала до старта потоков — ровно тот
+    // случай, для которого этот вызов и существует.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 
