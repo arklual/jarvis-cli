@@ -8,10 +8,18 @@
 //! Состояние формы — чистые данные, а переходы — чистая функция: что именно
 //! получится из ответов, проверяют тесты, а не глаза на живом экране.
 
-use crate::core::state::{Bundle, Gate};
+use crate::core::state::{Bundle, Critic, Exit, Gate, Limits, Loop, Sandbox};
 use crate::core::util::now_ms;
 use crate::engine::builder;
 use crate::engine::presets::Slot;
+
+/// Что заводим.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Kind {
+    #[default]
+    Bundle,
+    Loop,
+}
 
 /// Что спрашиваем сейчас.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,31 +28,67 @@ pub enum Step {
     Name,
     Base,
     Gates,
+    /// Цель цикла одной фразой.
+    Goal,
+    /// Откуда цикл берёт задачи.
+    Source,
 }
 
 /// Собираемая связка: ответы по шагам.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Form {
+    pub kind: Kind,
     pub dir: String,
     pub name: String,
     pub base: String,
+    pub goal: String,
+    pub command: String,
     pub gates: Vec<Gate>,
     step: usize,
 }
 
-const STEPS: [Step; 4] = [Step::Dir, Step::Name, Step::Base, Step::Gates];
+const BUNDLE_STEPS: [Step; 4] = [Step::Dir, Step::Name, Step::Base, Step::Gates];
+/// У цикла спрашиваем только то, без чего он не поедет: остальное — разумные
+/// умолчания, которые правятся в панели или в файле. Длинная форма в окне
+/// отпугивает ровно так же, как отпугивал конструктор в панели.
+const LOOP_STEPS: [Step; 5] = [Step::Dir, Step::Name, Step::Goal, Step::Source, Step::Gates];
 
 impl Form {
-    /// Новая форма: каталог, откуда запущено окно, — самый вероятный ответ.
+    /// Новая форма связки: каталог, откуда запущено окно, — самый вероятный
+    /// ответ.
     pub fn new(cwd: &str) -> Self {
         Self {
+            kind: Kind::Bundle,
             dir: cwd.to_string(),
             ..Default::default()
         }
     }
 
+    pub fn new_loop(cwd: &str) -> Self {
+        Self {
+            kind: Kind::Loop,
+            dir: cwd.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn steps(&self) -> &'static [Step] {
+        match self.kind {
+            Kind::Bundle => &BUNDLE_STEPS,
+            Kind::Loop => &LOOP_STEPS,
+        }
+    }
+
+    pub fn title(&self) -> &'static str {
+        match self.kind {
+            Kind::Bundle => "Новая связка",
+            Kind::Loop => "Новый цикл",
+        }
+    }
+
     pub fn step(&self) -> Step {
-        STEPS[self.step.min(STEPS.len() - 1)]
+        let steps = self.steps();
+        steps[self.step.min(steps.len() - 1)]
     }
 
     /// Вопрос текущего шага и умолчание, которое примет пустой Enter.
@@ -54,8 +98,16 @@ impl Form {
             Step::Name => ("Имя связки", dir_name(&self.dir)),
             Step::Base => ("Базовая ветка", "main".to_string()),
             Step::Gates => (
-                "Гейты перед вливанием: номера через запятую",
+                match self.kind {
+                    Kind::Bundle => "Гейты перед вливанием: номера через запятую",
+                    Kind::Loop => "Чем проверять работу: номера через запятую",
+                },
                 "пусто — без гейтов".to_string(),
+            ),
+            Step::Goal => ("Цель цикла одной фразой", String::new()),
+            Step::Source => (
+                "Откуда брать задачи: номер",
+                "пусто — работать по цели".to_string(),
             ),
         }
     }
@@ -86,6 +138,23 @@ impl Form {
                     a.into()
                 };
             }
+            Step::Goal => {
+                // Цель — единственное, чего не придумать за человека: цикл без
+                // неё крутит непонятно что и останавливается непонятно когда.
+                if a.is_empty() {
+                    return false;
+                }
+                self.goal = a.to_string();
+            }
+            Step::Source => {
+                if !a.is_empty() {
+                    let cat = builder::catalog(Slot::Source);
+                    let Some(i) = crate::ui::prompt::parse_choice(a, cat.len(), usize::MAX) else {
+                        return false;
+                    };
+                    self.command = cat[i].command.to_string();
+                }
+            }
             Step::Gates => {
                 let cat = builder::catalog(Slot::Gate);
                 // Непонятые номера не молчат: лучше переспросить, чем завести
@@ -104,7 +173,7 @@ impl Form {
             }
         }
         self.step += 1;
-        self.step >= STEPS.len()
+        self.step >= self.steps().len()
     }
 
     /// Чего не хватает для запуска — то же, что проверяет команда.
@@ -114,9 +183,38 @@ impl Form {
             out.push("каталог нужен полным путём".into());
         }
         if self.name.trim().is_empty() {
-            out.push("у связки нет имени".into());
+            out.push("нет имени".into());
+        }
+        if self.kind == Kind::Loop && self.goal.trim().is_empty() {
+            out.push("у цикла нет цели".into());
         }
         out
+    }
+
+    /// Готовый цикл. Всё, чего не спрашивали, — умолчания: критик включён,
+    /// стены на месте, будильник ручной. Цикл, который проснётся сам в первую
+    /// же ночь после заведения, — не то, чего ждут от пяти вопросов.
+    pub fn build_loop(&self) -> Loop {
+        let mut l = Loop {
+            id: format!("loop-{}", now_ms()),
+            name: self.name.clone(),
+            agent: "claude".into(),
+            sandbox: Sandbox {
+                repo: self.dir.clone(),
+                ..Default::default()
+            },
+            exit: Exit {
+                gates: self.gates.clone(),
+                critic: Critic::default(),
+                ..Default::default()
+            },
+            limits: Limits::default(),
+            created_at: now_ms(),
+            ..Default::default()
+        };
+        l.source.goal = self.goal.clone();
+        l.source.command = self.command.clone();
+        l
     }
 
     /// Готовая связка. Машина — та, в которой открыто окно: руки поднимутся
@@ -141,7 +239,7 @@ impl Form {
     /// Уже отвеченное — чтобы человек видел, что набрал, а не помнил.
     pub fn filled(&self) -> Vec<(&'static str, String)> {
         let mut out = Vec::new();
-        for (i, s) in STEPS.iter().enumerate() {
+        for (i, s) in self.steps().iter().enumerate() {
             if i >= self.step {
                 break;
             }
@@ -149,6 +247,15 @@ impl Form {
                 Step::Dir => ("каталог", self.dir.clone()),
                 Step::Name => ("имя", self.name.clone()),
                 Step::Base => ("база", self.base.clone()),
+                Step::Goal => ("цель", self.goal.clone()),
+                Step::Source => (
+                    "задачи",
+                    if self.command.is_empty() {
+                        "по цели".to_string()
+                    } else {
+                        self.command.clone()
+                    },
+                ),
                 Step::Gates => (
                     "гейты",
                     if self.gates.is_empty() {
@@ -235,6 +342,51 @@ mod tests {
         assert!(!f.accept("999"), "форма закрылась на кривом ответе");
         assert_eq!(f.step(), Step::Gates, "вопрос обязан остаться");
         assert!(f.accept(""), "пустой ответ закрывает форму");
+    }
+
+    /// Цикл заводится теми же пятью вопросами, и всё неспрошенное — разумные
+    /// умолчания: критик на месте, стены на месте, будильник ручной.
+    #[test]
+    fn a_loop_gets_defaults_for_everything_unasked() {
+        let mut f = Form::new_loop("/srv/proj");
+        assert_eq!(f.title(), "Новый цикл");
+        f.accept("");
+        f.accept("ночной обход");
+        assert!(!f.accept(""), "цель обязательна — вопрос остаётся");
+        assert_eq!(f.step(), Step::Goal);
+        f.accept("чинить красные тесты");
+        f.accept("");
+        assert!(f.accept("1"));
+
+        let l = f.build_loop();
+        assert_eq!(l.name, "ночной обход");
+        assert_eq!(l.sandbox.repo, "/srv/proj");
+        assert_eq!(l.source.goal, "чинить красные тесты");
+        assert!(l.source.command.is_empty(), "источник не выбирали");
+        assert_eq!(l.exit.gates.len(), 1);
+        assert!(
+            l.exit.critic.enabled,
+            "критик — умолчание, а не забытое поле"
+        );
+        assert!(
+            l.limits.iterations > 0 && l.limits.tokens > 0,
+            "цикл без стен"
+        );
+        assert_eq!(l.wake_label(), "только руками", "сам просыпаться не должен");
+        assert!(f.problems().is_empty());
+    }
+
+    /// Источник задач берётся номером из каталога — как в конструкторе команды.
+    #[test]
+    fn a_loop_source_comes_from_the_catalog() {
+        let cat = builder::catalog(Slot::Source);
+        let mut f = Form::new_loop("/srv/proj");
+        f.accept("");
+        f.accept("");
+        f.accept("чинить");
+        assert!(!f.accept("999"), "чужой номер не проходит");
+        f.accept("2");
+        assert_eq!(f.command, cat[1].command);
     }
 
     #[test]

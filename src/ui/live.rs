@@ -23,7 +23,7 @@ use crate::core::state;
 use crate::core::util::now_ms;
 use crate::ui::chat::{self, Feed, Item};
 use crate::ui::editor::Editor;
-use crate::ui::form::Form;
+use crate::ui::form::{Form, Kind};
 use crate::ui::render::{self, Window};
 use crate::ui::slash;
 use crate::ui::style::{band, header, key, pad, paint, truncate, width, Bg, Caps, Role};
@@ -430,11 +430,14 @@ fn toggle_pause(id: &str, on: bool) -> Result<(), String> {
 }
 
 /// Завести связку: спрашиваем по одному вопросу в той же строке ввода.
-fn start_form(ui: &mut Ui) {
+fn start_form(ui: &mut Ui, kind: Kind) {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".into());
-    ui.form = Some(Form::new(&cwd));
+    ui.form = Some(match kind {
+        Kind::Bundle => Form::new(&cwd),
+        Kind::Loop => Form::new_loop(&cwd),
+    });
     ui.typing = Typing::Field;
     ui.input.clear();
     ui.status.clear();
@@ -693,22 +696,47 @@ async fn handle(
                 ui.status = problems.join(" · ");
                 return true;
             }
-            let b = form.build(&ui.machine);
-            let mut all = state::load_bundles();
-            all.push(b.clone());
-            match state::save_bundles(&all) {
-                Ok(_) => {
-                    ui.bundles = all;
-                    ui.disk_at = now_ms();
-                    // Сразу в пульт новой связки: следующий шаг — завести руку,
-                    // и он должен быть под рукой, а не через два экрана.
-                    ui.open_bundle = b.id.clone();
-                    ui.bsel = ui.bundles.len().saturating_sub(1);
-                    ui.hsel = 0;
-                    ui.view = View::Bundle;
-                    ui.status = format!("связка «{}» заведена · n — первая рука", b.name);
+            match form.kind {
+                Kind::Bundle => {
+                    let b = form.build(&ui.machine);
+                    let mut all = state::load_bundles();
+                    all.push(b.clone());
+                    match state::save_bundles(&all) {
+                        Ok(_) => {
+                            ui.bundles = all;
+                            ui.disk_at = now_ms();
+                            // Сразу в пульт новой связки: следующий шаг —
+                            // завести руку, и он должен быть под рукой, а не
+                            // через два экрана.
+                            ui.open_bundle = b.id.clone();
+                            ui.bsel = ui.bundles.len().saturating_sub(1);
+                            ui.hsel = 0;
+                            ui.view = View::Bundle;
+                            ui.status = format!("связка «{}» заведена · n — первая рука", b.name);
+                        }
+                        Err(e) => ui.status = format!("не записал связки: {e}"),
+                    }
                 }
-                Err(e) => ui.status = format!("не записал связки: {e}"),
+                Kind::Loop => {
+                    let l = form.build_loop();
+                    let mut all = state::load_loops();
+                    all.push(l.clone());
+                    match state::save_loops(&all) {
+                        Ok(_) => {
+                            ui.loops = all;
+                            ui.disk_at = now_ms();
+                            ui.view = View::Loops;
+                            // Про запуск говорим честно: цикл идёт часами и
+                            // печатает ход, и это работа командной строки, а
+                            // не окна.
+                            ui.status = format!(
+                                "цикл «{}» заведён · запуск: jarvis loop start {}",
+                                l.name, l.name
+                            );
+                        }
+                        Err(e) => ui.status = format!("не записал циклы: {e}"),
+                    }
+                }
             }
         }
         Act::Send if ui.typing == Typing::Task => {
@@ -853,9 +881,8 @@ async fn handle(
                 Err(e) => ui.status = e,
             }
         }
-        Act::NewHand if ui.view == View::Bundles => {
-            start_form(ui);
-        }
+        Act::NewHand if ui.view == View::Bundles => start_form(ui, Kind::Bundle),
+        Act::NewHand if ui.view == View::Loops => start_form(ui, Kind::Loop),
         Act::NewHand => {
             if ui.view != View::Bundle {
                 ui.status = "новая связка — в списке связок (b), новая рука — в пульте".into();
@@ -933,10 +960,20 @@ async fn run_slash(
         "loops" | "loop" => ui.view = View::Loops,
         "bundles" | "bundle" => ui.view = View::Bundles,
         "new" => {
-            // Форма спрашивает по одному вопросу — из любого вида, не только
-            // из списка связок: `/new` человек наберёт там, где вспомнил.
-            ui.view = View::Bundles;
-            start_form(ui);
+            // `/new` человек наберёт там, где вспомнил, поэтому уточнить можно
+            // словом, а без слова — по тому виду, где он стоит.
+            let kind = match rest.trim().to_lowercase().as_str() {
+                "loop" | "цикл" => Kind::Loop,
+                "bundle" | "связка" | "связку" => Kind::Bundle,
+                _ if ui.view == View::Loops => Kind::Loop,
+                _ => Kind::Bundle,
+            };
+            ui.view = if kind == Kind::Loop {
+                View::Loops
+            } else {
+                View::Bundles
+            };
+            start_form(ui, kind);
         }
         "limits" => {
             ui.limits_at = 0; // следующий круг перечитает
@@ -1142,11 +1179,8 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
 
     // Шапка-полоса: слева — где мы, справа — сводка. Полосу видно боковым
     // зрением, и экран читается как приложение, а не как вывод команды.
-    if ui.form.is_some() {
-        push(
-            &mut out,
-            &header(caps, "Новая связка", "Esc — отменить", total),
-        );
+    if let Some(f) = ui.form.as_ref() {
+        push(&mut out, &header(caps, f.title(), "Esc — отменить", total));
         push(&mut out, "");
     }
     let (left, right) = match ui.view {
@@ -1357,7 +1391,8 @@ fn keys_hint(caps: &Caps, ui: &Ui) -> String {
             ("p", "пауза"),
             ("esc", "назад"),
         ],
-        View::Screen | View::Loops | View::Help => {
+        View::Loops => vec![("n", "новый цикл"), ("esc", "назад"), ("q", "выход")],
+        View::Screen | View::Help => {
             vec![("esc", "назад"), ("q", "выход")]
         }
     };
@@ -1443,9 +1478,16 @@ fn draw_loops(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
         .max()
         .unwrap_or(10)
         .clamp(8, 24);
+    let inner = Caps {
+        width: (caps.width as usize).saturating_sub(2) as u16,
+        ..*caps
+    };
     for l in all.iter().take(rows) {
         let run = state::load_run(&l.id);
-        push(out, &render::loop_row(caps, l, run.as_ref(), col));
+        push(
+            out,
+            &format!(" {}", render::loop_row(&inner, l, run.as_ref(), col)),
+        );
     }
 }
 
@@ -1527,9 +1569,14 @@ fn draw_form(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
         ),
     );
 
-    if form.step() == crate::ui::form::Step::Gates {
+    let slot = match form.step() {
+        crate::ui::form::Step::Gates => Some(crate::engine::presets::Slot::Gate),
+        crate::ui::form::Step::Source => Some(crate::engine::presets::Slot::Source),
+        _ => None,
+    };
+    if let Some(slot) = slot {
         push(out, "");
-        let cat = crate::engine::builder::catalog(crate::engine::presets::Slot::Gate);
+        let cat = crate::engine::builder::catalog(slot);
         let col = cat
             .iter()
             .map(|p| width(p.name))

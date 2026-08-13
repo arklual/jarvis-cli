@@ -189,8 +189,10 @@ pub fn loop_row(caps: &Caps, l: &Loop, run: Option<&Run>, name_col: usize) -> St
             &format!("{waiting} ждёт взгляда"),
         ));
     }
+    // Состояние и расписание разделяем точкой: без неё «не запускался только
+    // руками» читается как одна невнятная фраза.
     format!(
-        "{} {} {} {}",
+        "{} {} {}{}",
         dot(caps, kind),
         pad(&truncate(&l.name, name_col), name_col),
         paint(
@@ -202,7 +204,11 @@ pub fn loop_row(caps: &Caps, l: &Loop, run: Option<&Run>, name_col: usize) -> St
             },
             &state
         ),
-        tail.join(" · ")
+        format!(
+            "{}{}",
+            paint(caps, Role::Border, " · "),
+            tail.join(&paint(caps, Role::Border, " · "))
+        )
     )
 }
 
