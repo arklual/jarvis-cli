@@ -5,11 +5,11 @@ use crate::core::machine::{self, Machine};
 use crate::core::node::NodeClient;
 use crate::core::session::{self, Session};
 use crate::core::state;
-use crate::core::util::{clock, ellipsize, now_ms};
+use crate::core::util::{clock, ellipsize, now_ms, one_line};
 use crate::engine::{self, builder, presets};
 use crate::ui::prompt;
 use crate::ui::render::{self, Window};
-use crate::ui::style::{paint, rule, Caps, Role};
+use crate::ui::style::{paint, rule, width, Caps, Role};
 use std::collections::HashMap;
 
 pub struct App {
@@ -128,7 +128,7 @@ pub async fn run(parsed: Parsed) -> Result<(), String> {
         Cmd::Chat { session, follow } => cmd_chat(&app, &parsed.machine, &session, follow).await,
         Cmd::Projects => cmd_projects(&app, &parsed.machine).await,
         Cmd::Machines => cmd_machines(&app).await,
-        Cmd::MachineAdd { name, host, dir } => cmd_machine_add(&app, &name, &host, &dir),
+        Cmd::MachineAdd { name, host, dir } => cmd_machine_add(&app, &name, &host, &dir).await,
         Cmd::MachineRm { name } => cmd_machine_rm(&app, &name),
         Cmd::Control { session, cmd } => cmd_control(&app, &parsed.machine, &session, &cmd).await,
         Cmd::Run { dir, agent } => cmd_run(&app, &parsed.machine, &dir, &agent).await,
@@ -283,21 +283,26 @@ async fn cmd_machines(app: &App) -> Result<(), String> {
             },
             Err(e) => (e, Role::Bad),
         };
+        // Причина отказа бывает длинной и с советом внутри; в строке таблицы
+        // ей место только до края экрана — целиком её скажет сама команда,
+        // ради которой человек сюда и пришёл.
+        let host = crate::ui::style::pad(&crate::ui::style::truncate(&m.ssh_host, 22), 22);
+        let room = (app.caps.width as usize).saturating_sub(col + 1 + width(&host) + 2);
         app.say(format!(
             "{} {}  {}",
             crate::ui::style::pad(&m.name, col),
+            paint(&app.caps, Role::Dim, &host),
             paint(
                 &app.caps,
-                Role::Dim,
-                &crate::ui::style::pad(&m.ssh_host, 22)
-            ),
-            paint(&app.caps, role, &word)
+                role,
+                &crate::ui::style::truncate(&ellipsize(&one_line(&word), 400), room.max(20))
+            )
         ));
     }
     Ok(())
 }
 
-fn cmd_machine_add(app: &App, name: &str, host: &str, dir: &str) -> Result<(), String> {
+async fn cmd_machine_add(app: &App, name: &str, host: &str, dir: &str) -> Result<(), String> {
     if name == "local" {
         return Err("«local» — это машина, на которой ты сейчас; переименовывать её некуда".into());
     }
@@ -308,14 +313,31 @@ fn cmd_machine_add(app: &App, name: &str, host: &str, dir: &str) -> Result<(), S
     };
     let next = machine::upsert_remote(&machine::read_settings(), &m);
     machine::write_settings(&next)?;
+    // Проверяем сразу: «записана» без проверки связи — обещание, о котором
+    // человек узнаёт следующей командой, уже забыв про эту.
+    let (word, extra) = match machine::connect(&m).await {
+        Ok((client, _t)) => match client.hello().await {
+            Ok(h) => (format!("записана и на связи · узел {}", h.version), None),
+            Err(e) => (
+                "записана".into(),
+                Some(format!(
+                    "ssh пускает, но узел молчит: {e}. На той стороне должен работать \
+                     jarvis-node и слушать {}/node.sock",
+                    m.dir
+                )),
+            ),
+        },
+        Err(e) => ("записана".into(), Some(e)),
+    };
     app.say(paint(
         &app.caps,
         Role::Accent,
-        &format!("машина «{name}» записана"),
+        &format!("машина «{name}» {word}"),
     ));
-    app.dim(&format!(
-        "проверить: jarvis -m {name} ls · ключ должен пускать без пароля (BatchMode)"
-    ));
+    if let Some(why) = extra {
+        app.say(paint(&app.caps, Role::Bad, &why));
+        app.dim("запись оставил: починишь связь — заработает без повторного add");
+    }
     Ok(())
 }
 

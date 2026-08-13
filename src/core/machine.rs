@@ -219,8 +219,13 @@ pub async fn open_tunnel(m: &Machine) -> Result<Tunnel, String> {
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    // Пятнадцать секунд молчания ничего не объясняют — спрашиваем причину.
+    probe_home(&Machine {
+        dir: "~".into(),
+        ..m.clone()
+    })?;
     Err(format!(
-        "ssh не открыл туннель за 15 секунд. Проверь руками: ssh {} true",
+        "ssh пускает, но туннель не поднялся за 15 секунд. Проверь руками: ssh {} true",
         m.ssh_host
     ))
 }
@@ -232,18 +237,59 @@ fn expand_home(dir: &str, m: &Machine) -> Result<String, String> {
     if !dir.starts_with('~') {
         return Ok(dir.to_string());
     }
+    Ok(dir.replacen('~', &probe_home(m)?, 1))
+}
+
+/// Спросить у узла его `$HOME` — заодно это проверка, что ssh вообще пускает.
+///
+/// Раньше любая неудача превращалась в «не узнал $HOME узла»: и запрет по
+/// ключу, и неизвестный хост, и опечатка в адресе. Человек читал совет вписать
+/// абсолютный путь и делал это — не помогало, потому что дело было не в пути.
+/// Причину знает stderr от ssh, и он говорит её прямо.
+fn probe_home(m: &Machine) -> Result<String, String> {
     let out = std::process::Command::new("ssh")
-        .args(["-o", "BatchMode=yes", &m.ssh_host, "printf %s \"$HOME\""])
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            &m.ssh_host,
+            "printf %s \"$HOME\"",
+        ])
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("ssh не ответил: {e}"))?;
+        .map_err(|e| format!("ssh не запустился: {e} (он вообще установлен?)"))?;
     let home = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if !home.starts_with('/') {
-        return Err(format!(
-            "не узнал $HOME узла — впиши абсолютный каталог вместо {dir}"
-        ));
+    if home.starts_with('/') {
+        return Ok(home);
     }
-    Ok(dir.replacen('~', &home, 1))
+    Err(ssh_hint(&m.ssh_host, &String::from_utf8_lossy(&out.stderr)))
+}
+
+/// Что именно не так со связью — словами и с ближайшим действием.
+pub fn ssh_hint(host: &str, stderr: &str) -> String {
+    let e = stderr.to_lowercase();
+    if e.contains("permission denied") || e.contains("no supported authentication") {
+        format!(
+            "ssh не пускает на {host} без пароля. Разложи ключ: ssh-copy-id {host} \
+             (пароль спросит один раз), потом проверь: ssh {host} true"
+        )
+    } else if e.contains("host key verification failed") || e.contains("known_hosts") {
+        format!("ssh не знает {host} в лицо. Подключись руками один раз: ssh {host} true")
+    } else if e.contains("could not resolve") || e.contains("name or service not known") {
+        format!("не нашёлся адрес {host} — проверь имя хоста")
+    } else if e.contains("connection refused") {
+        format!("{host} отказал в соединении: sshd там слушает?")
+    } else if e.contains("timed out") || e.contains("timeout") {
+        format!("{host} не отвечает: сеть, файрвол или машина спит")
+    } else {
+        let first = stderr
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("ssh промолчал");
+        format!("ssh до {host} не дошёл: {first}")
+    }
 }
 
 fn free_port() -> Option<u16> {
@@ -260,6 +306,24 @@ pub async fn connect(m: &Machine) -> Result<(NodeClient, Option<Tunnel>), String
     if m.is_local() {
         let sock = node_sock(&m.dir);
         if !std::path::Path::new(&sock).exists() {
+            // Отдельный случай: на ноутбуке узла и не должно быть — агенты
+            // живут на сервере. Совет «запусти jarvis-node» тут уводит в
+            // сторону, а нужное действие человек уже почти сделал.
+            let remotes: Vec<String> = list()
+                .into_iter()
+                .filter(|x| !x.is_local())
+                .map(|x| x.name)
+                .collect();
+            if !remotes.is_empty() {
+                return Err(format!(
+                    "на этой машине узла нет ({sock}). Агенты, похоже, на другой — попробуй: {}",
+                    remotes
+                        .iter()
+                        .map(|r| format!("jarvis -m {r} ls"))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                ));
+            }
             return Err(format!(
                 "узла нет на {sock} — проверь, запущен ли jarvis-node, \
                  и верен ли JARVIS_DIR"
@@ -317,6 +381,31 @@ pub async fn run(m: &Machine, cwd: &str, cmd: &str, timeout: Duration) -> (i32, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ошибка ssh должна называть причину и следующее действие. «Не узнал
+    /// $HOME» на запрет по ключу отправляло чинить не то — и не помогало.
+    #[test]
+    fn ssh_failures_are_named_by_their_real_cause() {
+        let denied = ssh_hint("me@vps", "me@vps: Permission denied (publickey).");
+        assert!(denied.contains("ssh-copy-id me@vps"), "{denied}");
+
+        let unknown = ssh_hint(
+            "me@vps",
+            "ssh: Could not resolve hostname vps: Name or service not known",
+        );
+        assert!(unknown.contains("адрес"), "{unknown}");
+
+        let hostkey = ssh_hint("me@vps", "Host key verification failed.");
+        assert!(hostkey.contains("ssh me@vps true"), "{hostkey}");
+
+        // Незнакомую беду не толкуем — показываем как есть, но не молчим.
+        let odd = ssh_hint(
+            "me@vps",
+            "kex_exchange_identification: read: Connection reset",
+        );
+        assert!(odd.contains("kex_exchange_identification"), "{odd}");
+        assert!(!ssh_hint("me@vps", "").is_empty());
+    }
 
     /// Файл общий с панелью: чужие ключи обязаны пережить нашу правку.
     #[test]

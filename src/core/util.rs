@@ -10,8 +10,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Каталог данных Jarvis: $JARVIS_DIR или ~/.jarvis — как у настольного.
 pub fn jarvis_dir() -> PathBuf {
     match std::env::var("JARVIS_DIR") {
-        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        Ok(d) if !d.is_empty() => expand_tilde(&d),
         _ => home_dir().join(".jarvis"),
+    }
+}
+
+/// Раскрыть `~` в начале пути.
+///
+/// Тильду раскрывает шелл, но не всякий и не всегда: `export JARVIS_DIR=~/.jarvis`
+/// в fish оставляет её строкой, и дальше всё честно работает — с каталогом,
+/// который буквально называется «~». Раскрываем сами: путь с тильдой человек
+/// имел в виду один, и это не «./~».
+pub fn expand_tilde(p: &str) -> PathBuf {
+    match p.strip_prefix('~') {
+        Some("") => home_dir(),
+        Some(rest) => match rest.strip_prefix('/') {
+            Some(rel) => home_dir().join(rel),
+            // «~user/…» нам не по адресу: чужой домашний каталог мы не знаем и
+            // гадать не станем — пусть остаётся как есть и честно не найдётся.
+            None => PathBuf::from(p),
+        },
+        None => PathBuf::from(p),
     }
 }
 
@@ -114,6 +133,16 @@ pub fn when(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tilde_becomes_the_home_directory() {
+        let home = home_dir();
+        assert_eq!(expand_tilde("~/.jarvis"), home.join(".jarvis"));
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("/srv/jarvis"), PathBuf::from("/srv/jarvis"));
+        // Чужой дом не выдумываем.
+        assert_eq!(expand_tilde("~bob/.jarvis"), PathBuf::from("~bob/.jarvis"));
+    }
 
     #[test]
     fn plural_follows_russian_rules_including_the_teens() {
