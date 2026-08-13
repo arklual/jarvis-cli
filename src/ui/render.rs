@@ -191,6 +191,8 @@ pub fn loop_row(caps: &Caps, l: &Loop, run: Option<&Run>, name_col: usize) -> St
     }
     // Состояние и расписание разделяем точкой: без неё «не запускался только
     // руками» читается как одна невнятная фраза.
+    let sep = paint(caps, Role::Border, " · ");
+    let rest = format!("{sep}{}", tail.join(&sep));
     format!(
         "{} {} {}{}",
         dot(caps, kind),
@@ -204,11 +206,7 @@ pub fn loop_row(caps: &Caps, l: &Loop, run: Option<&Run>, name_col: usize) -> St
             },
             &state
         ),
-        format!(
-            "{}{}",
-            paint(caps, Role::Border, " · "),
-            tail.join(&paint(caps, Role::Border, " · "))
-        )
+        rest
     )
 }
 
