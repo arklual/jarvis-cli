@@ -99,6 +99,8 @@ pub enum Act {
     Pause,
     /// Новая рука: спросить задачу.
     NewHand,
+    /// Убрать выбранное (связку) — со вторым нажатием как подтверждением.
+    Remove,
     /// Правка строки ввода.
     Left,
     Right,
@@ -190,6 +192,7 @@ pub fn map_key(view_is_text: bool, k: KeyEvent) -> Act {
         KeyCode::Char('m') => Act::Merge,
         KeyCode::Char('p') => Act::Pause,
         KeyCode::Char('n') => Act::NewHand,
+        KeyCode::Char('d') => Act::Remove,
         KeyCode::Char('?') | KeyCode::Char('h') => Act::Help,
         KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => Act::Answer(c as u8 - b'0'),
         _ => Act::None,
@@ -241,6 +244,12 @@ struct Ui {
     /// Где мы работаем: связка заводится на этой же машине, руки поднимутся
     /// там же, где за ними смотрят.
     machine: String,
+    /// Что уже просили убрать: второе нажатие подтверждает.
+    ///
+    /// Подтверждение клавишей, а не окном с кнопками: промах по «d» не должен
+    /// стирать связку, но и городить модальное окно ради одного вопроса
+    /// незачем.
+    confirm_rm: Option<String>,
     /// Заводим связку: форма спрашивает по одному вопросу.
     form: Option<Form>,
     /// Долгое действие уже идёт. Второе нажатие «влить» подряд — это два
@@ -277,6 +286,7 @@ impl Default for Ui {
             hsel: 0,
             open_bundle: String::new(),
             machine: "local".into(),
+            confirm_rm: None,
             form: None,
             busy: None,
         }
@@ -605,6 +615,10 @@ async fn handle(
         Act::Quit => return false,
         // Отмена набора — отдельный шаг: Esc в наборе не должен ещё и
         // выбрасывать из вида, где человек стоит.
+        Act::Escape if ui.confirm_rm.is_some() => {
+            ui.confirm_rm = None;
+            ui.status = "не убираю".into();
+        }
         Act::Escape if ui.typing == Typing::Field => {
             ui.form = None;
             ui.input.clear();
@@ -1026,6 +1040,98 @@ async fn handle(
                 Err(e) => ui.status = e,
             }
         }
+        Act::Remove if matches!(ui.view, View::Bundles | View::Bundle) => {
+            let b = if ui.view == View::Bundle {
+                current_bundle(ui).cloned()
+            } else {
+                ui.bundles.get(ui.bsel).cloned()
+            };
+            let Some(b) = b else {
+                ui.status = "нечего убирать".into();
+                return true;
+            };
+            if ui.confirm_rm.as_deref() != Some(b.id.as_str()) {
+                let live = crate::engine::bundle::alive(&b).len();
+                ui.confirm_rm = Some(b.id.clone());
+                ui.status = if live > 0 {
+                    format!(
+                        "«{}»: {} ещё в работе. Убрать вместе с ними? d — да, esc — нет",
+                        b.name,
+                        crate::core::util::plural(live as u64, "рука", "руки", "рук")
+                    )
+                } else {
+                    format!("убрать «{}»? d — да, esc — нет", b.name)
+                };
+                return true;
+            }
+            ui.confirm_rm = None;
+            // Worktree и ветки не трогаем: в окне у человека нет ни флага
+            // `--clean`, ни возможности прочитать отказ git по каждой руке.
+            let all = state::load_bundles();
+            let Some(i) = all.iter().position(|x| x.id == b.id) else {
+                ui.status = "связка уже убрана".into();
+                return true;
+            };
+            match crate::engine::bundle::remove(all, i, true, false).await {
+                Ok(report) => {
+                    ui.bundles = state::load_bundles();
+                    ui.bsel = ui.bsel.min(ui.bundles.len().saturating_sub(1));
+                    ui.open_bundle.clear();
+                    ui.view = View::Bundles;
+                    ui.status = report.join(" · ");
+                }
+                Err(e) => ui.status = e,
+            }
+        }
+        Act::Remove if matches!(ui.view, View::Bundles | View::Bundle) => {
+            let b = if ui.view == View::Bundle {
+                current_bundle(ui).cloned()
+            } else {
+                ui.bundles.get(ui.bsel).cloned()
+            };
+            let Some(b) = b else {
+                ui.status = "нечего убирать".into();
+                return true;
+            };
+            if ui.confirm_rm.as_deref() != Some(b.id.as_str()) {
+                // Первое нажатие спрашивает, второе делает: промах по клавише
+                // не должен стирать связку, а модальное окно ради одного
+                // вопроса — лишнее.
+                let live = crate::engine::bundle::alive(&b).len();
+                ui.confirm_rm = Some(b.id.clone());
+                ui.status = if live > 0 {
+                    format!(
+                        "«{}»: {} ещё в работе. Убрать вместе с ними? d — да, esc — нет",
+                        b.name,
+                        crate::core::util::plural(live as u64, "рука", "руки", "рук")
+                    )
+                } else {
+                    format!("убрать «{}»? d — да, esc — нет", b.name)
+                };
+                return true;
+            }
+            ui.confirm_rm = None;
+            // Worktree и ветки не трогаем: в окне нет ни флага `--clean`, ни
+            // места прочитать отказ git по каждой руке.
+            let all = state::load_bundles();
+            let Some(i) = all.iter().position(|x| x.id == b.id) else {
+                ui.status = "связка уже убрана".into();
+                return true;
+            };
+            match crate::engine::bundle::remove(all, i, true, false).await {
+                Ok(report) => {
+                    ui.bundles = state::load_bundles();
+                    ui.bsel = ui.bsel.min(ui.bundles.len().saturating_sub(1));
+                    ui.open_bundle.clear();
+                    ui.view = View::Bundles;
+                    ui.status = report.join(" · ");
+                }
+                Err(e) => ui.status = e,
+            }
+        }
+        Act::Remove => {
+            ui.status = "убирать можно связку — в её списке (b)".into();
+        }
         Act::NewHand if ui.view == View::Bundles => start_form(ui, Kind::Bundle).await,
         Act::NewHand if ui.view == View::Loops => start_form(ui, Kind::Loop).await,
         Act::NewHand => {
@@ -1158,6 +1264,7 @@ async fn run_slash(
         "stop" => return as_key(ui, Act::Interrupt, client, list, caps, tx).await,
         "merge" => return as_key(ui, Act::Merge, client, list, caps, tx).await,
         "pause" => return as_key(ui, Act::Pause, client, list, caps, tx).await,
+        "rm" => return as_key(ui, Act::Remove, client, list, caps, tx).await,
         "hand" => {
             if ui.view != View::Bundle {
                 ui.status = "рука заводится в пульте связки: /bundles, потом Enter".into();
@@ -1546,15 +1653,17 @@ fn keys_hint(caps: &Caps, ui: &Ui) -> String {
         View::Bundles => vec![
             ("↑↓", "выбор"),
             ("↵", "пульт"),
-            ("n", "новая связка"),
+            ("n", "новая"),
+            ("d", "убрать"),
             ("esc", "назад"),
         ],
         View::Bundle => vec![
             ("↑↓", "выбор"),
             ("↵", "чат руки"),
-            ("m", "влить голову"),
+            ("m", "влить"),
             ("n", "рука"),
             ("p", "пауза"),
+            ("d", "убрать"),
             ("esc", "назад"),
         ],
         View::Loops => vec![

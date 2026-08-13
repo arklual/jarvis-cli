@@ -950,7 +950,11 @@ async fn cmd_bundle(app: &App, machine: &str, action: BundleAction) -> Result<()
                 app.say(format!(
                     "{}  {}  {}",
                     crate::ui::style::pad(&b.name, 18),
-                    paint(&app.caps, Role::Dim, &format!("{} рук", b.hands.len())),
+                    paint(
+                        &app.caps,
+                        Role::Dim,
+                        &crate::core::util::plural(b.hands.len() as u64, "рука", "руки", "рук")
+                    ),
                     if q > 0 {
                         paint(&app.caps, Role::Accent, &format!("{q} в очереди"))
                     } else {
@@ -1000,6 +1004,12 @@ async fn cmd_bundle(app: &App, machine: &str, action: BundleAction) -> Result<()
                     app.dim(&format!("{}  {}", clock(e.at), e.text));
                 }
             }
+            Ok(())
+        }
+        BundleAction::Rm { id, force, clean } => {
+            let (all, i) = find_bundle(&id)?;
+            let report = engine::bundle::remove(all, i, force, clean).await?;
+            say_report(app, &report);
             Ok(())
         }
         BundleAction::Merge { id, hand } => {

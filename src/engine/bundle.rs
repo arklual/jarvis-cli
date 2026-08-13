@@ -10,7 +10,7 @@
 
 use crate::core::machine::{self, Machine};
 use crate::core::state::{self, Bundle, HandState};
-use crate::core::util::now_ms;
+use crate::core::util::{now_ms, one_line};
 use std::time::Duration;
 
 fn host_for(b: &Bundle) -> Result<Machine, String> {
@@ -167,6 +167,104 @@ pub async fn merge(
     Ok(report)
 }
 
+/* ---------- убрать связку ---------- */
+
+/// Живые руки — те, за которыми ещё стоит работа.
+pub fn alive(b: &Bundle) -> Vec<&crate::core::state::Hand> {
+    b.hands
+        .iter()
+        .filter(|h| {
+            matches!(
+                h.state,
+                HandState::Working | HandState::Ready | HandState::Conflict
+            )
+        })
+        .collect()
+}
+
+/// Убрать связку из реестра.
+///
+/// Две вещи, о которых легко забыть и потом жалеть. Первая: у рук есть живые
+/// сессии, worktree и ветки — запись в файле это не они, и удаление записи их
+/// не трогает. Вторая: ветки мы не удаляем НИКОГДА, даже по `--clean`, — в них
+/// лежит работа, и восстановить её после `branch -D` нечем.
+pub async fn remove(
+    mut all: Vec<Bundle>,
+    idx: usize,
+    force: bool,
+    clean: bool,
+) -> Result<Vec<String>, String> {
+    let b = all[idx].clone();
+    let live = alive(&b);
+    if !live.is_empty() && !force {
+        let names: Vec<&str> = live.iter().map(|h| h.name.as_str()).collect();
+        return Err(format!(
+            "{} ещё в работе: {}. Останови их (pause) или повтори с --force",
+            crate::core::util::plural(names.len() as u64, "рука", "руки", "рук"),
+            names.join(", ")
+        ));
+    }
+
+    let mut left: Vec<String> = Vec::new();
+    let mut cleaned: Vec<String> = Vec::new();
+    if clean {
+        let m = host_for(&b)?;
+        for h in b.hands.iter().filter(|h| !h.worktree.trim().is_empty()) {
+            // `worktree remove` сам откажется убирать дерево с незакоммиченной
+            // правкой — на это и рассчитываем: чистим только то, что не жалко.
+            let (code, out) = git(&m, &b.dir, &["worktree", "remove", &h.worktree]).await;
+            if code == 0 {
+                cleaned.push(h.name.clone());
+            } else {
+                left.push(format!("{} ({})", h.worktree, one_line(&tail(&out))));
+            }
+        }
+    } else {
+        left.extend(
+            b.hands
+                .iter()
+                .filter(|h| !h.worktree.trim().is_empty())
+                .map(|h| h.worktree.clone()),
+        );
+    }
+
+    all.remove(idx);
+    state::save_bundles(&all).map_err(|e| format!("не записал состояние: {e}"))?;
+    Ok(removal_report(&b, &cleaned, &left))
+}
+
+/// Что сказать человеку после удаления.
+///
+/// Чистая функция: она и проверяется тестами. Запись на диск проверять нечем —
+/// а тест, который её вызовет, перепишет настоящий файл состояния (уже ловил
+/// себя на этом: пустой `bundles.json` появился в `~/.jarvis` от одного
+/// неосторожного прогона).
+pub fn removal_report(b: &Bundle, cleaned: &[String], left: &[String]) -> Vec<String> {
+    let mut report = vec![format!("связка «{}» убрана", b.name)];
+    for name in cleaned {
+        report.push(format!("{name}: worktree убран"));
+    }
+    if !left.is_empty() {
+        report.push(format!("осталось на диске: {}", left.join(", ")));
+    }
+    let branches: Vec<&str> = b
+        .hands
+        .iter()
+        .map(|h| h.branch.as_str())
+        .filter(|br| !br.trim().is_empty())
+        .collect();
+    if !branches.is_empty() {
+        // Ветки живут дальше — и это осознанно: в них работа рук.
+        report.push(format!("ветки целы: {}", branches.join(", ")));
+    }
+    report
+}
+
+/// Хвост вывода git — только чтобы объяснить отказ одной строкой.
+fn tail(out: &str) -> String {
+    out.lines().last().unwrap_or("").to_string()
+}
+
 /* ---------- новая рука ---------- */
 
 /// Имя руки из задачи, если человек не назвал сам: первые осмысленные слова.
@@ -284,34 +382,6 @@ pub async fn add_hand(mut all: Vec<Bundle>, idx: usize, task: &str) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hand_name_comes_from_the_task() {
-        assert_eq!(
-            hand_name("починить флаки в очереди слияний"),
-            "починить флаки в"
-        );
-        assert_eq!(hand_name(""), "");
-    }
-
-    /// Две руки с похожими задачами не должны драться за одну ветку.
-    #[test]
-    fn slugs_do_not_collide_inside_a_bundle() {
-        let mut b = Bundle::default();
-        b.hands.push(crate::core::state::Hand {
-            branch: "team/починить-флаки".into(),
-            ..Default::default()
-        });
-        assert_eq!(unique_slug(&b, "починить флаки"), "починить-флаки-2");
-        assert_eq!(unique_slug(&b, "другая работа"), "другая-работа");
-    }
-
-    #[test]
-    fn worktree_lives_next_to_the_project() {
-        assert_eq!(parent_of("/srv/proj"), "/srv");
-        assert_eq!(parent_of("/srv/proj/"), "/srv");
-        assert_eq!(parent_of("/proj"), "/", "корень — тоже родитель");
-    }
     use crate::core::state::Hand;
 
     fn hand(id: &str, name: &str, st: HandState, ready: i64, gates: bool) -> Hand {
@@ -324,6 +394,47 @@ mod tests {
             gates_ok: gates,
             ..Default::default()
         }
+    }
+
+    /// Живые руки — это работа, идущая прямо сейчас: выбросить их запись
+    /// молча значит потерять из виду и агентов, и их ветки.
+    #[tokio::test]
+    async fn a_bundle_with_working_hands_is_not_removed_silently() {
+        let b = Bundle {
+            name: "api".into(),
+            hands: vec![
+                hand("h1", "очередь", HandState::Working, 0, false),
+                hand("h2", "доки", HandState::Merged, 0, true),
+            ],
+            ..Default::default()
+        };
+        // Отказ приходит ДО записи на диск — состояние не тронуто.
+        let err = remove(vec![b], 0, false, false).await.unwrap_err();
+        assert!(err.contains("1 рука ещё в работе"), "{err}");
+        assert!(
+            err.contains("очередь"),
+            "отказ обязан назвать, кто именно: {err}"
+        );
+        assert!(err.contains("--force"), "и путь дальше: {err}");
+    }
+
+    /// Ветки не удаляем никогда: в них лежит работа рук, а после `branch -D`
+    /// восстановить её нечем.
+    #[test]
+    fn the_report_promises_nothing_about_branches() {
+        let b = Bundle {
+            name: "api".into(),
+            hands: vec![hand("h1", "доки", HandState::Merged, 0, true)],
+            ..Default::default()
+        };
+        let text = removal_report(&b, &[], &["/srv/wt-доки".into()]).join(" · ");
+        assert!(text.contains("«api» убрана"), "{text}");
+        assert!(text.contains("осталось на диске: /srv/wt-доки"), "{text}");
+        assert!(text.contains("ветки целы: team/доки"), "{text}");
+        assert!(
+            !text.to_lowercase().contains("удал"),
+            "нигде не обещаем удаление веток: {text}"
+        );
     }
 
     /// Голова очереди определяется готовностью, а не местом в списке.

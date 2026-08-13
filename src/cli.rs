@@ -104,10 +104,26 @@ pub enum LoopAction {
 pub enum BundleAction {
     Ls,
     New,
-    Hand { id: String, task: String },
-    Show { id: String },
-    Merge { id: String, hand: String },
-    Pause { id: String, on: bool },
+    Hand {
+        id: String,
+        task: String,
+    },
+    Show {
+        id: String,
+    },
+    Merge {
+        id: String,
+        hand: String,
+    },
+    Pause {
+        id: String,
+        on: bool,
+    },
+    Rm {
+        id: String,
+        force: bool,
+        clean: bool,
+    },
 }
 
 /// Разобранная команда вместе с общими флагами.
@@ -153,6 +169,7 @@ jarvis — агенты, циклы и связка прямо в термина
   jarvis bundle hand <id> <задача>  добавить руку и поднять её агента
   jarvis bundle merge <id> <рука>   влить голову очереди
   jarvis bundle pause <id>   пауза всем рукам
+  jarvis bundle rm <id>      убрать связку (--clean — снести и worktree рук)
 
   jarvis notify              печатать события по мере появления
 
@@ -355,13 +372,20 @@ fn parse_bundle(rest: &[String]) -> Result<Cmd, String> {
                 .cloned()
                 .ok_or("какую руку вливаем? jarvis bundle merge <id> <рука>")?,
         },
+        "rm" | "remove" | "delete" => BundleAction::Rm {
+            id: id()?,
+            // Живые руки просто так не выбрасываем, а worktree не убираем без
+            // просьбы: и то и другое — чужая работа.
+            force: rest.iter().any(|a| a == "--force"),
+            clean: rest.iter().any(|a| a == "--clean"),
+        },
         "pause" => BundleAction::Pause {
             id: id()?,
             on: !rest.iter().any(|a| a == "--off"),
         },
         other => {
             return Err(format!(
-                "не знаю «bundle {other}»: есть new, ls, show, hand, merge, pause"
+                "не знаю «bundle {other}»: есть new, ls, show, hand, merge, pause, rm"
             ))
         }
     };
