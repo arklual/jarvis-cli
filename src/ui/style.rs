@@ -417,6 +417,33 @@ pub fn dot(caps: &Caps, kind: &str) -> String {
     }
 }
 
+/// Кадр спиннера. Те же брайлевские точки, что у pi: они мельче букв и не
+/// прыгают по ширине, а в ASCII-терминале честно вырождаются в палочку.
+///
+/// Крутящийся значок — не украшение: он единственный отвечает на вопрос «оно
+/// живое или повисло», пока идёт чужая долгая работа.
+pub fn spinner(caps: &Caps, tick: u64) -> String {
+    const DOTS: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    const ASCII: [&str; 4] = ["|", "/", "-", "\\"];
+    let frame = if caps.unicode {
+        DOTS[(tick as usize) % DOTS.len()]
+    } else {
+        ASCII[(tick as usize) % ASCII.len()]
+    };
+    paint(caps, Role::Accent, frame)
+}
+
+/// Сколько идёт: «12 с», «3 м 05 с». Без времени спиннер говорит «живое», но
+/// не говорит «слишком долго» — а это второй вопрос, который задают.
+pub fn elapsed(ms: i64) -> String {
+    let sec = (ms / 1000).max(0);
+    if sec < 60 {
+        format!("{sec} с")
+    } else {
+        format!("{} м {:02} с", sec / 60, sec % 60)
+    }
+}
+
 /// Цвет по доле занятого: спокойный до трёх четвертей, тревожный у стены.
 pub fn level(pct: u8) -> Role {
     if pct > 90 {
@@ -498,6 +525,39 @@ pub fn key(caps: &Caps, k: &str, what: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Спиннер обязан крутиться и не менять ширину: прыгающая на ячейку
+    /// строка состояния читается как дрожь.
+    #[test]
+    fn the_spinner_turns_without_changing_width() {
+        let c = Caps {
+            color: false,
+            truecolor: false,
+            unicode: true,
+            width: 40,
+        };
+        let frames: Vec<String> = (0..10).map(|i| spinner(&c, i)).collect();
+        assert!(frames.iter().all(|f| width(f) == 1), "{frames:?}");
+        assert!(
+            frames.windows(2).any(|w| w[0] != w[1]),
+            "спиннер не крутится"
+        );
+        assert_eq!(spinner(&c, 0), spinner(&c, 10), "круг замкнулся");
+        // В ASCII-терминале — палочка, а не пустота.
+        let a = Caps {
+            unicode: false,
+            ..c
+        };
+        assert_eq!(width(&spinner(&a, 0)), 1);
+    }
+
+    #[test]
+    fn elapsed_reads_like_a_clock() {
+        assert_eq!(elapsed(0), "0 с");
+        assert_eq!(elapsed(12_000), "12 с");
+        assert_eq!(elapsed(185_000), "3 м 05 с");
+        assert_eq!(elapsed(-5), "0 с", "часы не идут назад");
+    }
 
     fn colored() -> Caps {
         Caps {

@@ -266,6 +266,8 @@ struct Ui {
     /// Где мы работаем: связка заводится на этой же машине, руки поднимутся
     /// там же, где за ними смотрят.
     machine: String,
+    /// Счётчик кадров — им крутится спиннер.
+    tick: u64,
     /// Что уже просили убрать: второе нажатие подтверждает.
     ///
     /// Подтверждение клавишей, а не окном с кнопками: промах по «d» не должен
@@ -275,8 +277,9 @@ struct Ui {
     /// Заводим связку: форма спрашивает по одному вопросу.
     form: Option<Form>,
     /// Долгое действие уже идёт. Второе нажатие «влить» подряд — это два
-    /// слияния, а очередь такого не прощает.
-    busy: Option<String>,
+    /// слияния, а очередь такого не прощает. Время начала — чтобы человек
+    /// видел не только «идёт», но и «сколько уже».
+    busy: Option<(String, i64)>,
 }
 
 impl Default for Ui {
@@ -311,6 +314,7 @@ impl Default for Ui {
             confirm_rm: None,
             form: None,
             busy: None,
+            tick: 0,
         }
     }
 }
@@ -358,6 +362,12 @@ pub async fn run(app: &App, machine_name: &str) -> Result<(), String> {
             shown.clear();
             print!("\x1b[2J");
         }
+        // Пока идёт долгая работа, кадр обязан меняться: спиннер и есть
+        // единственный признак жизни. В покое тик не трогаем — иначе экран
+        // перерисовывался бы вхолостую двенадцать раз в секунду.
+        if ui.busy.is_some() {
+            ui.tick = ui.tick.wrapping_add(1);
+        }
         present(&frame(&caps, &m.name, &ui, &list, rows), &mut shown);
 
         // 1. Клавиши — первым делом: отклик важнее свежести данных.
@@ -396,10 +406,16 @@ pub async fn run(app: &App, machine_name: &str) -> Result<(), String> {
                 Msg::Done(res) => {
                     // Долгое действие закончилось: снимаем занятость и
                     // показываем итог там же, где человек его ждёт.
-                    ui.busy = None;
+                    let took = ui
+                        .busy
+                        .take()
+                        .map(|(_, since)| crate::ui::style::elapsed(now_ms() - since))
+                        .unwrap_or_default();
                     ui.status = match res {
-                        Ok(report) => report.join(" · "),
-                        Err(e) => format!("не вышло: {e}"),
+                        // Сколько это заняло — часть итога: «влито» без времени
+                        // не даёт понять, дорого ли обошлось.
+                        Ok(report) => format!("{} · {took}", report.join(" · ")),
+                        Err(e) => format!("не вышло: {e} · {took}"),
                     };
                     ui.disk_at = 0; // связки на диске изменились — перечитать
                 }
@@ -880,7 +896,7 @@ async fn handle(
                 ui.status = problems.join(" · ");
                 return true;
             }
-            ui.busy = Some(format!("цикл {}", l.name));
+            ui.busy = Some((format!("цикл {}", l.name), now_ms()));
             ui.status = format!("{}: прогон пошёл", l.name);
             ui.open_loop = l.id.clone();
             ui.view = View::Loop;
@@ -1024,7 +1040,7 @@ async fn handle(
             };
             ui.typing = idle_typing(ui);
             ui.input.clear();
-            ui.busy = Some("поднимаю руку".into());
+            ui.busy = Some(("поднимаю руку".to_string(), now_ms()));
             ui.status = "поднимаю руку: worktree, ветка, агент…".into();
             let (tx, id) = (tx.clone(), b.id.clone());
             tokio::spawn(async move {
@@ -1167,7 +1183,7 @@ async fn handle(
             };
             // Долгое (git, ssh, гейты) уходит в фон: окно обязано слушаться
             // клавиш всё это время, иначе оно выглядит зависшим.
-            ui.busy = Some(format!("вливаю {head}"));
+            ui.busy = Some((format!("вливаю {head}"), now_ms()));
             ui.status = format!("вливаю {head}…");
             let (tx, id) = (tx.clone(), b.id.clone());
             tokio::spawn(async move {
@@ -1441,7 +1457,7 @@ async fn run_slash(
                 return true;
             }
             let (dir, client2, tx2) = (rest.to_string(), client.clone(), tx.clone());
-            ui.busy = Some("поднимаю агента".into());
+            ui.busy = Some(("поднимаю агента".to_string(), now_ms()));
             ui.status = format!("поднимаю агента в {dir}…");
             tokio::spawn(async move {
                 let name = dir
@@ -1676,10 +1692,26 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
     }
 
     push(&mut out, "");
-    if ui.view == View::List {
+    if ui.view == View::List && ui.busy.is_none() {
         push(
             &mut out,
             &format!(" {}", render::limits_line(caps, &ui.limits)),
+        );
+    } else if let Some((what, since)) = ui.busy.as_ref() {
+        // Пока идёт чужая долгая работа, строка состояния отвечает сразу на два
+        // вопроса: живое ли оно и сколько уже тянется.
+        push(
+            &mut out,
+            &format!(
+                " {} {} {}",
+                crate::ui::style::spinner(caps, ui.tick),
+                paint(caps, Role::Text, what),
+                paint(
+                    caps,
+                    Role::Dim,
+                    &crate::ui::style::elapsed(now_ms() - since)
+                )
+            ),
         );
     } else if !ui.status.is_empty() {
         push(
@@ -2666,7 +2698,7 @@ mod tests {
     #[tokio::test]
     async fn merge_while_busy_is_refused() {
         let mut ui = bundle_ui();
-        ui.busy = Some("вливаю доки".into());
+        ui.busy = Some(("вливаю доки".to_string(), now_ms()));
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let client = NodeClient::unix("/nonexistent.sock");
         let caps = Caps::default();
