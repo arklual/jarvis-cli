@@ -391,15 +391,15 @@ fn table(caps: &Caps, rows: &[Vec<String>], room: usize) -> Vec<String> {
     let mut out = Vec::new();
     for (n, row) in rows.iter().enumerate() {
         let mut line = String::from("  ");
-        for c in 0..cols {
+        for (c, cw) in w.iter().enumerate() {
             let cell = row.get(c).map(String::as_str).unwrap_or("");
-            let cell = truncate(cell, w[c]);
+            let cell = truncate(cell, *cw);
             let painted = if n == 0 {
                 accent(caps, Role::Text, &[1], &cell)
             } else {
                 inline(caps, &cell, Role::Text)
             };
-            line.push_str(&pad(&painted, w[c]));
+            line.push_str(&pad(&painted, *cw));
             if c + 1 < cols {
                 line.push_str("  ");
             }
