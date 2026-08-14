@@ -338,6 +338,11 @@ pub fn bold(caps: &Caps, text: &str) -> String {
 /// буквы упираются в границу цвета.
 pub fn band(caps: &Caps, bg: Bg, text: &str, total: usize) -> String {
     let inner = total.saturating_sub(2);
+    if !caps.color {
+        // Без краски подложки нет, и добивать строку пробелами не за чем:
+        // в `jarvis chat > файл` они станут хвостами из ниоткуда.
+        return format!(" {}", truncate(text, inner));
+    }
     let body = format!(" {} ", pad(&truncate(text, inner), inner));
     on_bg(caps, bg, &body)
 }
@@ -950,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn band_without_color_is_just_padded_text() {
+    fn band_without_color_is_just_text() {
         let c = Caps {
             color: false,
             theme: Theme::Dark,
@@ -958,8 +963,10 @@ mod tests {
             unicode: true,
             width: 40,
         };
+        // Без краски подложки нет — значит и добивать строку пробелами не за
+        // чем: в `jarvis chat > файл` из них выйдут хвосты из ниоткуда.
         let line = band(&c, Bg::User, "привет", 20);
-        assert_eq!(line, " привет             ");
+        assert_eq!(line, " привет");
         assert!(!line.contains('\x1b'));
     }
 

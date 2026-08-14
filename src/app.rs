@@ -30,7 +30,12 @@ impl App {
     }
 
     pub fn dim(&self, line: &str) {
-        println!("{}", paint(&self.caps, Role::Dim, line));
+        // Переносим по ширине окна: подсказки бывают длиннее строки, а
+        // терминал рвёт их посреди слова.
+        let room = (self.caps.width as usize).saturating_sub(1).max(20);
+        for l in crate::ui::style::wrap(line, room) {
+            println!("{}", paint(&self.caps, Role::Dim, &l));
+        }
     }
 }
 
