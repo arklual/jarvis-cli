@@ -5,7 +5,7 @@
 //! ходов терминалу воспроизводить незачем — за ними идут в панель.
 
 use crate::core::node::Recorded;
-use crate::core::util::{ellipsize, one_line};
+use crate::core::util::{ellipsize, one_line, plain_text};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -201,7 +201,7 @@ fn detail_for(event: &str, asks: bool, payload: &Value, prev: &str) -> String {
             if head.is_empty() {
                 "готово".into()
             } else {
-                ellipsize(&one_line(head), 120)
+                ellipsize(&plain_text(&one_line(head)), 120)
             }
         }
         "stop-failure" => match classify(payload) {

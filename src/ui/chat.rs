@@ -137,9 +137,81 @@ fn tool_detail(input: Option<&Value>) -> String {
     String::new()
 }
 
-/// Разметку показываем как текст: в терминале `**Готово**` — это не жирный
-/// шрифт, а четыре лишних знака. Убираем только явные маркеры, содержимое
-/// строки не трогаем.
+/// Как показать строку разметки.
+///
+/// Раньше маркеры просто стирались, и весь ответ выглядел ровной серой стеной.
+/// У pi разметка рендерится (components/markdown.ts): заголовок — весом, код —
+/// своим тоном, список — значком. Здесь то же, но скупо: терминал не браузер, а
+/// пять уровней заголовков в чате никому не нужны.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Md {
+    /// Обычный текст.
+    Plain(String),
+    /// Заголовок — весом, а не решётками.
+    Head(String),
+    /// Пункт списка.
+    Item(String),
+    /// Строка кода внутри ```-блока.
+    Code(String),
+    /// Цитата.
+    Quote(String),
+}
+
+/// Разобрать текст ответа в строки разметки.
+///
+/// Внутри ```-блока разметку не трогаем вовсе: там код, и «звёздочка» в нём —
+/// это звёздочка, а не жирный шрифт.
+pub fn markdown(text: &str) -> Vec<Md> {
+    let mut out = Vec::new();
+    let mut in_code = false;
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        let t = line.trim_start();
+        if t.starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            out.push(Md::Code(line.to_string()));
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("> ") {
+            out.push(Md::Quote(inline(rest)));
+        } else if t.starts_with('#') {
+            let title = t.trim_start_matches('#').trim();
+            if title.is_empty() {
+                out.push(Md::Plain(String::new()));
+            } else {
+                out.push(Md::Head(inline(title)));
+            }
+        } else if let Some(rest) = t
+            .strip_prefix("- ")
+            .or_else(|| t.strip_prefix("* "))
+            .or_else(|| t.strip_prefix("+ "))
+        {
+            out.push(Md::Item(inline(rest)));
+        } else if let Some((num, rest)) = numbered(t) {
+            out.push(Md::Item(format!("{num}. {}", inline(rest))));
+        } else {
+            out.push(Md::Plain(inline(line)));
+        }
+    }
+    out
+}
+
+/// «1. пункт» → (1, «пункт»).
+fn numbered(t: &str) -> Option<(u32, &str)> {
+    let (head, rest) = t.split_once(". ")?;
+    head.parse::<u32>().ok().map(|n| (n, rest))
+}
+
+/// Строчная разметка: жирный и курсив в терминале рисовать нечем, зато
+/// звёздочки мешают читать. Обратные кавычки оставляем: код в строке видно.
+fn inline(s: &str) -> String {
+    crate::core::util::plain_text(s)
+}
+
+/// Разметку показываем как текст — для строк, где формат не важен.
 fn plain_md(s: &str) -> String {
     let mut out = s.replace("**", "");
     out = out.trim_start_matches('#').trim_start().to_string();
@@ -170,10 +242,49 @@ pub fn block(caps: &Caps, it: &Item, total: usize) -> Vec<String> {
                 .map(|l| band(caps, Bg::User, &format!(" {l}"), total))
                 .collect()
         }
-        Kind::Agent => wrap(&plain_md(&it.text), total.saturating_sub(4))
-            .into_iter()
-            .map(|l| format!("  {}", paint(caps, Role::Text, &l)))
-            .collect(),
+        Kind::Agent => {
+            let room = total.saturating_sub(4);
+            let mut out = Vec::new();
+            for md in markdown(&it.text) {
+                match md {
+                    Md::Head(t) => {
+                        for l in wrap(&t, room) {
+                            out.push(format!("  {}", crate::ui::style::bold(caps, &l)));
+                        }
+                    }
+                    Md::Item(t) => {
+                        for (i, l) in wrap(&t, room.saturating_sub(2)).into_iter().enumerate() {
+                            let mark = if i == 0 { "·" } else { " " };
+                            out.push(format!(
+                                "  {} {}",
+                                paint(caps, Role::Accent, mark),
+                                paint(caps, Role::Text, &l)
+                            ));
+                        }
+                    }
+                    Md::Code(t) => out.push(format!(
+                        "  {}",
+                        paint(caps, Role::Muted, &truncate(&t, room))
+                    )),
+                    Md::Quote(t) => {
+                        for l in wrap(&t, room.saturating_sub(2)) {
+                            out.push(format!(
+                                "  {} {}",
+                                paint(caps, Role::Border, "│"),
+                                paint(caps, Role::Muted, &l)
+                            ));
+                        }
+                    }
+                    Md::Plain(t) if t.trim().is_empty() => out.push(String::new()),
+                    Md::Plain(t) => {
+                        for l in wrap(&t, room) {
+                            out.push(format!("  {}", paint(caps, Role::Text, &l)));
+                        }
+                    }
+                }
+            }
+            out
+        }
         Kind::Tool => {
             let mark = if caps.unicode { "⏺" } else { "*" };
             let head = format!(
@@ -417,6 +528,56 @@ mod tests {
             "main.rs",
             "в ленте нужно имя, а не весь путь"
         );
+    }
+
+    /// Разметка обязана становиться формой, а не исчезать: серая стена текста
+    /// одинаково выглядит и для плана, и для отчёта.
+    #[test]
+    fn markdown_becomes_shape() {
+        let md = markdown(
+            "# Итог\n\nСделал:\n- первое\n- второе\n\n```\nfn main() {}\n```\n> и заметка",
+        );
+        assert!(matches!(&md[0], Md::Head(t) if t == "Итог"));
+        assert!(matches!(&md[3], Md::Item(t) if t == "первое"));
+        assert!(md
+            .iter()
+            .any(|m| matches!(m, Md::Code(t) if t.contains("fn main"))));
+        assert!(md
+            .iter()
+            .any(|m| matches!(m, Md::Quote(t) if t == "и заметка")));
+        // Тройные кавычки сами по себе в ленту не попадают.
+        assert!(!md
+            .iter()
+            .any(|m| matches!(m, Md::Plain(t) if t.contains("```"))));
+    }
+
+    /// Внутри блока кода разметку не трогаем: звёздочка там — звёздочка.
+    #[test]
+    fn code_blocks_keep_their_asterisks() {
+        let md = markdown("```\nlet x = a * b * c;\n```");
+        assert!(matches!(&md[0], Md::Code(t) if t.contains("a * b * c")));
+    }
+
+    /// Умножение не должно превращаться в курсив.
+    #[test]
+    fn multiplication_survives_the_italics_rule() {
+        let md = markdown("площадь = 2 * 2 * 3");
+        assert!(
+            matches!(&md[0], Md::Plain(t) if t.contains("2 * 2 * 3")),
+            "{md:?}"
+        );
+        // А парные звёздочки вокруг слова — убираем.
+        let md = markdown("это *важно* сегодня");
+        assert!(
+            matches!(&md[0], Md::Plain(t) if t == "это важно сегодня"),
+            "{md:?}"
+        );
+    }
+
+    #[test]
+    fn numbered_lists_keep_their_numbers() {
+        let md = markdown("1. первое\n2. второе");
+        assert!(matches!(&md[0], Md::Item(t) if t == "1. первое"), "{md:?}");
     }
 
     /// Реплика человека и ответ агента должны различаться на глаз мгновенно:

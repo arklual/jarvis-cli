@@ -80,6 +80,41 @@ pub fn clock(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// Убрать разметку из строки, которую покажут одной строкой.
+///
+/// В терминале `**Готово**` — не жирный шрифт, а четыре лишних знака, и в
+/// списке сессий они лезут в глаза первыми. Курсив снимаем только парный:
+/// «2 * 2» обязано остаться умножением.
+pub fn plain_text(s: &str) -> String {
+    let no_bold = s.replace("**", "").replace("__", "");
+    let chars: Vec<char> = no_bold.chars().collect();
+    let mut out = String::with_capacity(no_bold.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '*' && chars.get(i + 1).is_some_and(|c| !c.is_whitespace()) {
+            let mut j = i + 1;
+            let mut close = None;
+            while j < chars.len() {
+                if chars[j] == '*' {
+                    if chars.get(j - 1).is_some_and(|c| !c.is_whitespace()) {
+                        close = Some(j);
+                    }
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(c) = close {
+                out.extend(chars[i + 1..c].iter());
+                i = c + 1;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Русское число словами: 1 сессия, 2 сессии, 5 сессий.
 ///
 /// «3 сессий» и «2 ждёт» — мелочь, но именно из таких мелочей складывается
@@ -142,6 +177,15 @@ mod tests {
         assert_eq!(expand_tilde("/srv/jarvis"), PathBuf::from("/srv/jarvis"));
         // Чужой дом не выдумываем.
         assert_eq!(expand_tilde("~bob/.jarvis"), PathBuf::from("~bob/.jarvis"));
+    }
+
+    /// Разметка не должна лезть в список: там читают смысл, а не звёздочки.
+    #[test]
+    fn plain_text_drops_markers_but_keeps_multiplication() {
+        assert_eq!(plain_text("**Готово**: 5,8 ГБ"), "Готово: 5,8 ГБ");
+        assert_eq!(plain_text("это *важно* сегодня"), "это важно сегодня");
+        assert_eq!(plain_text("площадь = 2 * 2"), "площадь = 2 * 2");
+        assert_eq!(plain_text("без разметки"), "без разметки");
     }
 
     #[test]
