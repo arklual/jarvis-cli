@@ -311,42 +311,187 @@ fn take_width(s: &str, max: usize) -> String {
     out
 }
 
-/// Видимая ширина строки: без ANSI-кодов и с учётом широких символов.
+/// Видимая ширина строки: без управляющих последовательностей и по кластерам.
 ///
-/// Без этого любая таблица с эмодзи или CJK разъезжается, а строка с краской
-/// считается длиннее, чем выглядит.
+/// Считать посимвольно нельзя: «👨‍👩‍👧» — это пять кодовых точек и одна ячейка на
+/// экране, а «й» из буквы и знака — две точки и одна ячейка. Ошибка здесь не
+/// косметическая: по ширине режутся строки, выравниваются колонки и рисуются
+/// подложки, и один лишний столбец ломает весь кадр.
+///
+/// Точность как у pi (packages/tui/src/utils.ts), но без таблиц Unicode:
+/// склеиваем базовый символ с тем, что не занимает места (диакритика,
+/// селекторы начертания, модификаторы тона, соединители), и меряем базу.
 pub fn width(s: &str) -> usize {
-    let mut w = 0usize;
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // ANSI-последовательность до финальной буквы
-            for e in chars.by_ref() {
-                if e.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-            continue;
-        }
-        w += char_width(c);
-    }
-    w
+    clusters(s).map(|(w, _)| w).sum()
 }
 
-/// Ширина символа в ячейках терминала.
+/// Разбор строки на кластеры: (ширина, текст кластера).
+///
+/// Управляющие последовательности (ANSI-цвет, OSC-ссылки) пропускаются целиком
+/// — места они не занимают, но в подсчёт лезут первыми.
+fn clusters(s: &str) -> impl Iterator<Item = (usize, &str)> {
+    let bytes = s.as_char_indices_vec();
+    ClusterIter {
+        s,
+        at: 0,
+        chars: bytes,
+    }
+}
+
+/// Вспомогательное: позиции символов, чтобы ходить по строке без паник.
+trait CharIndices {
+    fn as_char_indices_vec(&self) -> Vec<(usize, char)>;
+}
+
+impl CharIndices for str {
+    fn as_char_indices_vec(&self) -> Vec<(usize, char)> {
+        self.char_indices().collect()
+    }
+}
+
+struct ClusterIter<'a> {
+    s: &'a str,
+    at: usize,
+    chars: Vec<(usize, char)>,
+}
+
+impl<'a> Iterator for ClusterIter<'a> {
+    type Item = (usize, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.at < self.chars.len() {
+            let (start, c) = self.chars[self.at];
+            // Управляющая последовательность: ESC [ … буква, ESC ] … BEL/ST.
+            if c == '\x1b' {
+                self.at += 1;
+                if let Some((_, next)) = self.chars.get(self.at).copied() {
+                    if next == ']' {
+                        // OSC: до BEL или ESC \.
+                        while self.at < self.chars.len() {
+                            let (_, ch) = self.chars[self.at];
+                            self.at += 1;
+                            if ch == '\x07' {
+                                break;
+                            }
+                            if ch == '\x1b' {
+                                self.at += 1;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                }
+                while self.at < self.chars.len() {
+                    let (_, ch) = self.chars[self.at];
+                    self.at += 1;
+                    if ch.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if zero_width(c) {
+                // Одинокий нулевой символ: места не занимает.
+                self.at += 1;
+                continue;
+            }
+            let mut w = char_width(c);
+            let mut end = self.at + 1;
+            // Приклеиваем всё, что не занимает места: диакритику, селекторы,
+            // модификаторы тона; соединитель ZWJ тянет за собой следующий
+            // символ — так семья эмодзи остаётся одной ячейкой.
+            while end < self.chars.len() {
+                let (_, next) = self.chars[end];
+                if zero_width(next) {
+                    // Селектор начертания превращает символ в эмодзи: «✅️»
+                    // занимает две ячейки, хотя сам знак — из узкого блока.
+                    if next == '\u{FE0F}' {
+                        w = 2;
+                    }
+                    let joiner = next == '\u{200D}';
+                    end += 1;
+                    if joiner && end < self.chars.len() {
+                        end += 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+            let from = start;
+            let to = self.chars.get(end).map(|(i, _)| *i).unwrap_or(self.s.len());
+            self.at = end;
+            return Some((w, &self.s[from..to]));
+        }
+        None
+    }
+}
+
+/// Символы, не занимающие ячейки: диакритика, селекторы, соединители.
+fn zero_width(c: char) -> bool {
+    let u = c as u32;
+    (0x300..=0x36F).contains(&u)          // комбинирующая диакритика
+        || (0x483..=0x489).contains(&u)   // кириллические знаки
+        || (0x591..=0x5BD).contains(&u)   // иврит
+        || (0x610..=0x61A).contains(&u)   // арабский
+        || (0x64B..=0x65F).contains(&u)
+        || (0x200B..=0x200F).contains(&u) // нулевые пробелы и соединители
+        || (0xFE00..=0xFE0F).contains(&u) // селекторы начертания
+        || (0xFE20..=0xFE2F).contains(&u)
+        || (0x1F3FB..=0x1F3FF).contains(&u) // модификаторы тона кожи
+        || (0xE0100..=0xE01EF).contains(&u)
+        || u == 0
+}
+
+/// Ширина базового символа в ячейках: две у иероглифов и эмодзи, одна у
+/// остального. Нулевые сюда не попадают — их отсекает `zero_width`.
 fn char_width(c: char) -> usize {
     let u = c as u32;
-    if u == 0 || (0x300..0x370).contains(&u) {
-        return 0; // управляющие и комбинирующие диакритики
-    }
     let wide = (0x1100..=0x115F).contains(&u)
-        || (0x2E80..=0xA4CF).contains(&u)  // CJK
-        || (0xAC00..=0xD7A3).contains(&u)  // хангыль
+        || (0x2E80..=0xA4CF).contains(&u)   // CJK
+        || (0xAC00..=0xD7A3).contains(&u)   // хангыль
         || (0xF900..=0xFAFF).contains(&u)
-        || (0xFF00..=0xFF60).contains(&u)  // полноширинные формы
+        || (0xFF00..=0xFF60).contains(&u)   // полноширинные формы
         || (0xFFE0..=0xFFE6).contains(&u)
         || (0x1F300..=0x1F64F).contains(&u) // эмодзи
-        || (0x1F900..=0x1F9FF).contains(&u);
+        || (0x1F680..=0x1F6FF).contains(&u)
+        || (0x1F900..=0x1F9FF).contains(&u)
+        || (0x1FA70..=0x1FAFF).contains(&u)
+        // Одиночные эмодзи из старых блоков: они узкие «по таблице», но
+        // терминалы рисуют их в две ячейки.
+        || matches!(
+            u,
+            0x231A..=0x231B
+                | 0x23E9..=0x23EC
+                | 0x25FD..=0x25FE
+                | 0x2614..=0x2615
+                | 0x2648..=0x2653
+                | 0x267F
+                | 0x2693
+                | 0x26A1
+                | 0x26AA..=0x26AB
+                | 0x26BD..=0x26BE
+                | 0x26C4..=0x26C5
+                | 0x26CE
+                | 0x26D4
+                | 0x26EA
+                | 0x26F2..=0x26F3
+                | 0x26F5
+                | 0x26FA
+                | 0x26FD
+                | 0x2705
+                | 0x270A..=0x270B
+                | 0x2728
+                | 0x274C
+                | 0x274E
+                | 0x2753..=0x2755
+                | 0x2757
+                | 0x2795..=0x2797
+                | 0x27B0
+                | 0x27BF
+                | 0x2B1B..=0x2B1C
+                | 0x2B50
+                | 0x2B55
+        );
     if wide {
         2
     } else {
@@ -357,20 +502,7 @@ fn char_width(c: char) -> usize {
 /// Снять краску: строка нужна как текст — например, чтобы положить её на
 /// подложку, где чужие сбросы цвета всё испортят.
 pub fn strip(s: &str) -> String {
-    let mut out = String::new();
-    let mut it = s.chars().peekable();
-    while let Some(c) = it.next() {
-        if c == '\x1b' {
-            for e in it.by_ref() {
-                if e.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-            continue;
-        }
-        out.push(c);
-    }
-    out
+    clusters(s).map(|(_, t)| t).collect()
 }
 
 /// Обрезать по видимой ширине, добавив многоточие.
@@ -603,7 +735,7 @@ mod tests {
         let c = colored();
         let h = header(&c, "Jarvis · local", "2 в работе", 40);
         assert_eq!(width(&h), 40);
-        let plain = strip(&h);
+        let plain = plain_csi(&h);
         assert!(plain.starts_with(" Jarvis"), "{plain:?}");
         assert!(plain.ends_with("2 в работе "), "{plain:?}");
     }
@@ -675,7 +807,8 @@ mod tests {
         );
     }
 
-    fn strip(s: &str) -> String {
+    /// Старый помощник тестов: снимает только цветовые последовательности.
+    fn plain_csi(s: &str) -> String {
         let mut out = String::new();
         let mut it = s.chars().peekable();
         while let Some(c) = it.next() {
@@ -720,6 +853,40 @@ mod tests {
         let c = caps(false, true);
         assert_eq!(paint(&c, Role::Accent, "готово"), "готово");
         assert!(!dot(&c, "waiting").contains('\x1b'));
+    }
+
+    /// Кластеры: буква с диакритикой, эмодзи с селектором и семья через
+    /// соединитель — по одной ячейке каждая. Ошибка здесь ломает всю вёрстку.
+    #[test]
+    fn width_counts_clusters_not_codepoints() {
+        assert_eq!(width("й"), 1);
+        assert_eq!(
+            width("и\u{306}"),
+            1,
+            "буква с комбинирующей краткой — одна ячейка"
+        );
+        assert_eq!(width("é\u{301}"), 1);
+        assert_eq!(
+            width("✅\u{FE0F}"),
+            2,
+            "селектор начертания места не занимает"
+        );
+        assert_eq!(width("👨\u{200D}👩\u{200D}👧"), 2, "семья — один кластер");
+        assert_eq!(
+            width("👍\u{1F3FD}"),
+            2,
+            "модификатор тона не добавляет ячейку"
+        );
+        assert_eq!(width("\u{200B}"), 0, "нулевой пробел");
+    }
+
+    /// OSC-последовательности (например ссылки) места не занимают — но в
+    /// наивном подсчёте они лезут первыми и сдвигают всю строку.
+    #[test]
+    fn width_skips_osc_sequences() {
+        let link = "\x1b]8;;https://example.com\x07текст\x1b]8;;\x07";
+        assert_eq!(width(link), 5, "видно только «текст»");
+        assert_eq!(strip(link), "текст");
     }
 
     #[test]
