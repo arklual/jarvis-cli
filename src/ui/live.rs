@@ -1245,6 +1245,14 @@ async fn handle(
                 format!("отбор: {}", filter_of(ui))
             };
         }
+        // Пустой Backspace в форме — «назад»: стирать уже нечего, а вернуться
+        // к прошлому вопросу человеку надо чаще, чем отменять всю форму.
+        Act::Backspace if ui.typing == Typing::Field && ui.input.is_empty() => {
+            if let Some(was) = ui.form.as_mut().and_then(Form::back) {
+                ui.input.set(was);
+                ui.status = "вернулся к прошлому вопросу".into();
+            }
+        }
         Act::Send if ui.typing == Typing::Field => {
             let answer = ui.input.text().to_string();
             let Some(form) = ui.form.as_mut() else {
@@ -2363,7 +2371,9 @@ fn keys_hint(caps: &Caps, ui: &Ui) -> String {
         _ if ui.typing == Typing::Filter => {
             vec![("набирай", "отбор"), ("↵", "оставить"), ("esc", "снять")]
         }
-        _ if ui.typing == Typing::Field => vec![("↵", "дальше"), ("esc", "отменить")],
+        _ if ui.typing == Typing::Field => {
+            vec![("↵", "дальше"), ("⌫", "назад"), ("esc", "отменить")]
+        }
         _ if ui.typing == Typing::Command => {
             vec![("↵", "выполнить"), ("tab", "дополнить"), ("esc", "отмена")]
         }
@@ -3749,5 +3759,30 @@ mod tests {
         let mut ui = ui_in(View::Chat, Typing::Message);
         assert!(press(&mut ui, Act::Break).await, "закрылось с первого раза");
         assert!(ui.status.contains("ещё раз"));
+    }
+    /// Форма без «назад» заставляет отменять всё из-за опечатки в первом
+    /// ответе. Пустой Backspace возвращает к прошлому вопросу вместе с тем,
+    /// что там было отвечено.
+    #[tokio::test]
+    async fn an_empty_backspace_walks_the_form_back() {
+        let mut ui = ui_in(View::Bundles, Typing::None);
+        press(&mut ui, Act::NewHand).await;
+        ui.input.set("/srv/проект");
+        press(&mut ui, Act::Send).await;
+        assert_eq!(
+            ui.form.as_ref().map(|f| f.step()),
+            Some(crate::ui::form::Step::Name)
+        );
+        press(&mut ui, Act::Backspace).await;
+        assert_eq!(
+            ui.form.as_ref().map(|f| f.step()),
+            Some(crate::ui::form::Step::Dir),
+            "не вернулись"
+        );
+        assert_eq!(ui.input.text(), "/srv/проект", "ответ не подставлен");
+        // На первом вопросе назад некуда — и форма не закрывается.
+        ui.input.clear();
+        press(&mut ui, Act::Backspace).await;
+        assert!(ui.form.is_some());
     }
 }
