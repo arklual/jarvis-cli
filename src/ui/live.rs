@@ -57,6 +57,8 @@ enum Typing {
     Command,
     /// Ответ на вопрос формы (заведение связки).
     Field,
+    /// Отбор: что показывать в списке или в ленте.
+    Filter,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -123,6 +125,8 @@ pub enum Act {
     Tab,
     /// Начать команду с «/».
     Slash,
+    /// Отбор по набранному: в списке — сессии, в ленте — строки.
+    Filter,
     /// Открыть набранное во внешнем редакторе.
     Editor,
     /// В начало и конец ленты.
@@ -171,6 +175,8 @@ pub fn map_key(view_is_text: bool, k: KeyEvent) -> Act {
             // Ctrl+X — как ^X^E в шелле: длинный промт пишут в редакторе, а не
             // в однострочном поле вслепую.
             KeyCode::Char('x') => Act::Editor,
+            // Ctrl+F — поиск там, где буквы принадлежат тексту.
+            KeyCode::Char('f') => Act::Filter,
             // Ctrl+D намеренно НЕ «удалить символ»: этим кодом терминал
             // сообщает о конце ввода, и он прилетает сам, когда стдин
             // закрывается. Поймано следом нажатий: символ под курсором
@@ -225,6 +231,7 @@ pub fn map_key(view_is_text: bool, k: KeyEvent) -> Act {
         KeyCode::Char('p') => Act::Pause,
         KeyCode::Char('n') => Act::NewHand,
         KeyCode::Char('d') => Act::Remove,
+        KeyCode::Char('f') => Act::Filter,
         KeyCode::Char('?') | KeyCode::Char('h') => Act::Help,
         KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => Act::Answer(c as u8 - b'0'),
         _ => Act::None,
@@ -767,6 +774,11 @@ async fn handle(
             ui.typing = Typing::None;
             ui.status = "не завожу".into();
         }
+        Act::Escape if ui.typing == Typing::Filter => {
+            ui.typing = idle_typing(ui);
+            ui.input.clear();
+            ui.status.clear();
+        }
         Act::Escape if matches!(ui.typing, Typing::Command | Typing::Task) => {
             ui.input.clear();
             ui.typing = idle_typing(ui);
@@ -999,6 +1011,15 @@ async fn handle(
                 _ => ui.status = "сессия не в tmux — вариант не отправить".into(),
             }
         }
+        Act::Send if ui.typing == Typing::Filter => {
+            // Enter в отборе ничего не отправляет: отбор — это взгляд, а не
+            // действие. Просто убираем строку, оставив выбранное на виду.
+            ui.status = if filter_of(ui).is_empty() {
+                String::new()
+            } else {
+                format!("отбор: {}", filter_of(ui))
+            };
+        }
         Act::Send if ui.typing == Typing::Field => {
             let answer = ui.input.text().to_string();
             let Some(form) = ui.form.as_mut() else {
@@ -1185,6 +1206,17 @@ async fn handle(
             } else if cands.is_empty() {
                 ui.status = "дополнять нечем".into();
             }
+        }
+        Act::Filter => {
+            // Отбор — это не команда: он ничего не делает, только показывает
+            // меньше. Поэтому своя строка, а не «/».
+            ui.typing = Typing::Filter;
+            ui.input.clear();
+            ui.status = if ui.view == View::Chat {
+                "что искать в ленте".into()
+            } else {
+                "отбор по имени".into()
+            };
         }
         Act::Slash => {
             ui.typing = Typing::Command;
@@ -1834,6 +1866,23 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
     out
 }
 
+/// Что сейчас отбираем. Пусто — показываем всё.
+fn filter_of(ui: &Ui) -> String {
+    if ui.typing == Typing::Filter {
+        ui.input.text().trim().to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Подходит ли строка под отбор: по похожести, а не по точному вхождению —
+/// человек набирает «жрв», имея в виду «jarvis».
+fn passes(filter: &str, text: &str) -> bool {
+    filter.is_empty()
+        || text.to_lowercase().contains(&filter.to_lowercase())
+        || crate::ui::slash::fuzzy_score(filter, text).is_some()
+}
+
 /// Открыть набранное во внешнем редакторе и забрать обратно.
 ///
 /// Длинный промт в однострочном поле пишут вслепую: не видно ни начала, ни
@@ -1975,6 +2024,9 @@ fn with_caret(caps: &Caps, line: &str, col: usize, room: usize) -> String {
 fn keys_hint(caps: &Caps, ui: &Ui) -> String {
     let pairs: Vec<(&str, &str)> = match ui.view {
         // Набор идёт поверх любого вида, поэтому его подсказки — первыми.
+        _ if ui.typing == Typing::Filter => {
+            vec![("набирай", "отбор"), ("↵", "оставить"), ("esc", "снять")]
+        }
         _ if ui.typing == Typing::Field => vec![("↵", "дальше"), ("esc", "отменить")],
         _ if ui.typing == Typing::Command => {
             vec![("↵", "выполнить"), ("tab", "дополнить"), ("esc", "отмена")]
@@ -1985,6 +2037,7 @@ fn keys_hint(caps: &Caps, ui: &Ui) -> String {
         View::List => vec![
             ("↑↓", "выбор"),
             ("↵", "чат"),
+            ("f", "отбор"),
             ("/", "команда"),
             ("s", "экран"),
             ("x", "прервать"),
@@ -1998,6 +2051,7 @@ fn keys_hint(caps: &Caps, ui: &Ui) -> String {
             ("↵", "отправить"),
             ("alt+↵", "новая строка"),
             ("^x", "редактор"),
+            ("^f", "поиск"),
             ("↑↓", "прошлые"),
             ("^w", "стереть слово"),
             ("^y", "вернуть"),
@@ -2069,9 +2123,21 @@ fn draw_list(out: &mut String, caps: &Caps, ui: &Ui, list: &[Session], rows: usi
         width: total.saturating_sub(2) as u16,
         ..*caps
     };
+    let filter = filter_of(ui);
+    let shown: Vec<&Session> = list
+        .iter()
+        .filter(|s| passes(&filter, &format!("{} {}", s.title(), s.detail)))
+        .collect();
+    if shown.is_empty() {
+        push(
+            out,
+            &paint(caps, Role::Muted, &format!(" под «{filter}» ничего нет")),
+        );
+        return;
+    }
     let col = render::name_column(list);
     let from = ui.sel.saturating_sub(rows.saturating_sub(1));
-    for (i, s) in list.iter().enumerate().skip(from).take(rows) {
+    for (i, s) in shown.iter().copied().enumerate().skip(from).take(rows) {
         let row = render::session_row(&inner, s, col);
         if i == ui.sel {
             push(out, &band(caps, Bg::Sel, &row, total));
@@ -2093,8 +2159,38 @@ fn draw_chat(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
     // высота, и считать видимое по числу записей — верный способ показать
     // половину сообщения.
     let total = caps.width as usize;
+    let filter = filter_of(ui);
     let tail = ui.items.len().saturating_sub(60);
-    let lines = chat::feed_lines(caps, &ui.items[tail..], total);
+    let slice: Vec<Item> = ui.items[tail..]
+        .iter()
+        .filter(|it| passes(&filter, &it.text) || passes(&filter, &it.detail))
+        .cloned()
+        .collect();
+    if slice.is_empty() {
+        push(
+            out,
+            &paint(
+                caps,
+                Role::Muted,
+                &format!(" под «{filter}» в ленте ничего нет"),
+            ),
+        );
+        return;
+    }
+    if !filter.is_empty() {
+        push(
+            out,
+            &paint(
+                caps,
+                Role::Dim,
+                &format!(
+                    " {} · esc — снять отбор",
+                    crate::core::util::plural(slice.len() as u64, "запись", "записи", "записей")
+                ),
+            ),
+        );
+    }
+    let lines = chat::feed_lines(caps, &slice, total);
     for l in visible(&lines, rows, ui.scroll) {
         push(out, l);
     }
@@ -2790,6 +2886,37 @@ mod tests {
             "команду не адресовали агенту: {}",
             ui.status
         );
+    }
+
+    /// Отбор по похожести: человек набирает «жрв», имея в виду «jarvis», и
+    /// точное вхождение тут не поможет.
+    #[test]
+    fn the_filter_matches_by_similarity_not_only_by_substring() {
+        assert!(passes("", "что угодно"), "пустой отбор пропускает всё");
+        assert!(passes("jar", "jarvis · выполняет Bash"));
+        assert!(
+            passes("jrv", "jarvis"),
+            "буквы по порядку — тоже совпадение"
+        );
+        assert!(!passes("zzz", "jarvis"));
+    }
+
+    /// Отбор — это взгляд, а не действие: Enter в нём ничего не отправляет.
+    #[tokio::test]
+    async fn filter_mode_sends_nothing() {
+        let mut ui = ui_in(View::List, Typing::None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let client = NodeClient::unix("/nonexistent.sock");
+        let caps = Caps::default();
+        handle(&mut ui, Act::Filter, &client, &[], &caps, &tx).await;
+        assert_eq!(ui.typing, Typing::Filter);
+        handle(&mut ui, Act::Type('j'), &client, &[], &caps, &tx).await;
+        handle(&mut ui, Act::Send, &client, &[], &caps, &tx).await;
+        assert!(rx.try_recv().is_err(), "отбор не должен ничего запускать");
+        // Esc снимает отбор и возвращает буквы навигации.
+        handle(&mut ui, Act::Escape, &client, &[], &caps, &tx).await;
+        assert_eq!(ui.typing, Typing::None);
+        assert!(ui.input.text().is_empty());
     }
 
     /// Аргумент дополняется из того, что человек видит: живые сессии, а не
