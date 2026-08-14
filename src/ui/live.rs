@@ -1663,12 +1663,17 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
     }
 
     // Полосы снизу: воздух, состояние, ввод (в чате) и клавиши.
-    let body =
-        (rows as usize).saturating_sub(if ui.view == View::Chat || (ui.typing != Typing::None) {
-            6
-        } else {
-            5
-        });
+    // Ввод бывает многострочным: тело кадра обязано подвинуться, иначе нижние
+    // строки уедут за экран и терминал начнёт его прокручивать.
+    let input_h = if typing_now(ui) {
+        let room = (caps.width as usize).saturating_sub(6);
+        let lines = ui.input.lines();
+        let (r, c) = ui.input.row_col();
+        wrap_input(&lines, r, c, room).0.len()
+    } else {
+        0
+    };
+    let body = (rows as usize).saturating_sub(5 + input_h);
     if ui.form.is_some() {
         draw_form(&mut out, caps, ui, body);
     } else {
@@ -1767,7 +1772,9 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
         // то, что ты печатаешь. Каретка — обратным цветом, как в pi.
         let room = total.saturating_sub(6);
         let (row, col) = ui.input.row_col();
-        for (i, line) in ui.input.lines().iter().enumerate() {
+        let lines = ui.input.lines();
+        let (shown, caret_row, caret_col) = wrap_input(&lines, row, col, room);
+        for (i, line) in shown.iter().enumerate() {
             let head = if i == 0 {
                 paint(caps, Role::Accent, "›")
             } else {
@@ -1775,8 +1782,8 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
                 // читалось как одно, а не как три реплики.
                 paint(caps, Role::Dim, "│")
             };
-            let body = if i == row {
-                with_caret(caps, line, col, room)
+            let body = if i == caret_row {
+                with_caret(caps, line, caret_col, room)
             } else {
                 truncate(line, room)
             };
@@ -1792,6 +1799,65 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
         out.truncate(out.len() - 2);
     }
     out
+}
+
+/// Сколько строк ввода показываем. Длинный промт не должен съедать ленту
+/// целиком: восемь строк — это абзац, дальше человек и сам не видит начала.
+const INPUT_ROWS: usize = 8;
+
+/// Разложить ввод по видимым строкам с переносом по словам и найти каретку.
+///
+/// Раньше длинная строка просто обрезалась: набранное за краем исчезало, и
+/// человек правил вслепую то, чего не видит. Перенос по словам — то же, что
+/// делает pi, и по той же причине.
+///
+/// Возвращает (видимые строки, строка каретки, колонка каретки).
+pub fn wrap_input(
+    lines: &[&str],
+    row: usize,
+    col: usize,
+    room: usize,
+) -> (Vec<String>, usize, usize) {
+    let room = room.max(4);
+    let mut out: Vec<String> = Vec::new();
+    let (mut caret_row, mut caret_col) = (0usize, 0usize);
+    for (i, line) in lines.iter().enumerate() {
+        let chunks = crate::ui::style::wrap(line, room);
+        if i == row {
+            // Ищем кусок, в который попала колонка курсора. Кусок мог
+            // потерять пробел на переносе, поэтому считаем по длине кусков.
+            let mut left = col;
+            let mut placed = false;
+            for (k, ch) in chunks.iter().enumerate() {
+                let len = ch.chars().count();
+                if left <= len {
+                    caret_row = out.len() + k;
+                    caret_col = left;
+                    placed = true;
+                    break;
+                }
+                // +1 — пробел, на котором строка была перенесена.
+                left = left.saturating_sub(len + 1);
+            }
+            if !placed {
+                caret_row = out.len() + chunks.len().saturating_sub(1);
+                caret_col = chunks.last().map(|c| c.chars().count()).unwrap_or(0);
+            }
+        }
+        out.extend(chunks);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    // Показываем окно вокруг каретки: править всегда нужно там, где она.
+    if out.len() > INPUT_ROWS {
+        let from = caret_row
+            .saturating_sub(INPUT_ROWS - 1)
+            .min(out.len() - INPUT_ROWS);
+        out = out[from..from + INPUT_ROWS].to_vec();
+        caret_row -= from;
+    }
+    (out, caret_row, caret_col)
 }
 
 /// Строка с кареткой: символ под курсором — обратным цветом.
@@ -2410,6 +2476,56 @@ mod tests {
             map_key(true, KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
             Act::Delete
         );
+    }
+
+    /// Длинная строка обязана переноситься, а не обрезаться: набранное за
+    /// краем исчезало, и человек правил вслепую то, чего не видит.
+    #[test]
+    fn a_long_line_wraps_and_the_caret_follows() {
+        let line = "раз два три четыре пять шесть семь восемь девять десять";
+        let (shown, row, col) = wrap_input(&[line], 0, line.chars().count(), 20);
+        assert!(shown.len() > 1, "строка не перенеслась: {shown:?}");
+        assert!(
+            shown.iter().all(|l| crate::ui::style::width(l) <= 20),
+            "{shown:?}"
+        );
+        assert_eq!(row, shown.len() - 1, "каретка не на последней строке");
+        assert!(col <= shown[row].chars().count());
+        // Ни одно слово не потерялось.
+        let joined = shown
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(joined, line);
+    }
+
+    #[test]
+    fn the_caret_lands_on_the_right_visual_row() {
+        let line = "первое второе третье четвёртое";
+        // Курсор на первом слове — каретка обязана быть на первой строке.
+        let (_, row, col) = wrap_input(&[line], 0, 3, 12);
+        assert_eq!((row, col), (0, 3));
+        // Курсор в конце — на последней.
+        let (shown, row2, _) = wrap_input(&[line], 0, line.chars().count(), 12);
+        assert_eq!(row2, shown.len() - 1);
+    }
+
+    /// Длинный промт не должен съедать ленту целиком, но каретка обязана
+    /// оставаться видимой — править всегда нужно там, где она.
+    #[test]
+    fn a_huge_input_shows_a_window_around_the_caret() {
+        let text: Vec<&str> = vec!["строка"; 30];
+        let (shown, row, _) = wrap_input(&text, 29, 3, 20);
+        assert_eq!(shown.len(), INPUT_ROWS, "окно ввода не ограничено");
+        assert!(row < shown.len(), "каретка уехала за окно");
+    }
+
+    #[test]
+    fn an_empty_input_still_has_one_row() {
+        let (shown, row, col) = wrap_input(&[""], 0, 0, 20);
+        assert_eq!(shown.len(), 1);
+        assert_eq!((row, col), (0, 0));
     }
 
     /// Каретка рисуется НА символе под курсором, ничего не съедая: ошибка на
