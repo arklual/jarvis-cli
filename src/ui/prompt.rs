@@ -287,23 +287,50 @@ fn pick(
         }
         out.push_str(&format!("{}\x1b[K\r\n", rule(caps, title)));
         let mut lines = 1usize;
-        let room = 12.min(shown.len().max(1));
+        // Строки списка вперемешку с заголовками разделов: «GitHub», «Rust» —
+        // без них десять источников задач читаются как одна каша. Ровно так же
+        // выглядит выбор номером, и терять это при переходе на стрелки нельзя.
+        let mut rows: Vec<Option<usize>> = Vec::new();
+        let mut group = String::new();
+        for i in shown.iter().copied() {
+            if items[i].group != group {
+                group = items[i].group.clone();
+                if !group.is_empty() {
+                    rows.push(None);
+                }
+            }
+            rows.push(Some(i));
+        }
+        let room = 14.min(rows.len().max(1));
         // Окно едет за выбранным, держа его В СЕРЕДИНЕ, как SelectList в pi:
         // прижатый к краю выбор не даёт увидеть, что идёт следом.
-        let pos = shown.iter().position(|i| *i == at).unwrap_or(0);
-        let from = window_start(pos, shown.len(), room);
+        let pos = rows.iter().position(|r| *r == Some(at)).unwrap_or(0);
+        let from = window_start(pos, rows.len(), room);
         // Названия — колонкой: неровный левый край второго столбца читается
         // как список случайных строк.
-        let labelw = shown
+        let labelw = rows
             .iter()
             .skip(from)
             .take(room)
-            .map(|i| width(&items[*i].label))
+            .filter_map(|r| r.map(|i| width(&items[i].label)))
             .max()
             .unwrap_or(12)
             .clamp(12, 32);
-        for i in shown.iter().copied().skip(from).take(room) {
+        let mut group = String::new();
+        for row in rows.iter().skip(from).take(room) {
+            let Some(i) = *row else {
+                continue;
+            };
             let c = &items[i];
+            // Заголовок раздела печатаем перед первой его строкой — в том
+            // числе когда окно въехало в середину раздела.
+            if c.group != group {
+                group = c.group.clone();
+                if !group.is_empty() {
+                    out.push_str(&format!("  {}\x1b[K\r\n", paint(caps, Role::Muted, &group)));
+                    lines += 1;
+                }
+            }
             let mark = if i == at { "▸" } else { " " };
             let label = if i == at {
                 paint(caps, Role::Accent, &c.label)
@@ -323,10 +350,11 @@ fn pick(
             lines += 1;
         }
         // Сколько всего и где мы — только когда список не поместился целиком.
-        if shown.len() > room {
+        if rows.len() > room {
+            let n = shown.iter().position(|i| *i == at).unwrap_or(0) + 1;
             out.push_str(&format!(
                 "    {}\x1b[K\r\n",
-                paint(caps, Role::Dim, &format!("{}/{}", pos + 1, shown.len()))
+                paint(caps, Role::Dim, &format!("{n}/{}", shown.len()))
             ));
             lines += 1;
         }
