@@ -1909,20 +1909,49 @@ fn present(frame: &str, last: &mut String) {
 
 /// Что именно отправить в терминал ради нового кадра. `None` — отправлять
 /// нечего: кадр тот же, и любая запись была бы чистой рябью.
+///
+/// Шлём только ИЗМЕНИВШИЕСЯ строки, перескакивая между ними курсором. Кадр в
+/// восемьдесят строк — это четыре килобайта; при двенадцати оборотах в секунду
+/// крутящийся волчок гнал бы их целиком, а меняется в нём одна строка. По ssh
+/// это разница между «живо» и «тянется».
+///
+/// Всё вместе заворачиваем в синхронный вывод (`?2026`): терминал показывает
+/// кадр целиком, а не по мере прихода строк. Кто про этот режим не знает —
+/// молча его игнорирует.
 fn repaint(frame: &str, last: &str) -> Option<String> {
     if frame == last {
         return None;
     }
+    let new: Vec<&str> = frame.split("\r\n").collect();
+    let old: Vec<&str> = if last.is_empty() {
+        Vec::new()
+    } else {
+        last.split("\r\n").collect()
+    };
+    let shrank = old.len() > new.len();
     let mut out = String::with_capacity(frame.len() + 64);
-    out.push_str("\x1b[H");
-    for (i, line) in frame.split("\r\n").enumerate() {
-        if i > 0 {
-            out.push_str("\r\n");
+    out.push_str("\x1b[?2026h\x1b[H");
+    let mut at = 0usize;
+    for (i, line) in new.iter().enumerate() {
+        // Последнюю строку при укорачивании кадра печатаем всегда: сразу за ней
+        // идёт стирание хвоста, а стирать надо ОТ её конца.
+        let same = old.get(i) == Some(line);
+        if same && !(shrank && i + 1 == new.len()) {
+            continue;
         }
+        if i > at {
+            out.push_str(&format!("\x1b[{}B", i - at));
+        }
+        out.push('\r');
         out.push_str(line);
         out.push_str("\x1b[K");
+        at = i;
     }
-    out.push_str("\x1b[J");
+    if shrank {
+        // Прошлый кадр был длиннее — под нами остались его строки.
+        out.push_str("\x1b[J");
+    }
+    out.push_str("\x1b[?2026l");
     Some(out)
 }
 
@@ -3068,15 +3097,31 @@ mod tests {
         );
         let other = frame(&frame_caps(), "vps", &Ui::default(), &sessions(2), 24);
         let out = repaint(&other, &f).expect("кадр изменился — рисуем");
-        assert!(out.starts_with("\x1b[H"));
-        assert!(out.ends_with("\x1b[J"), "хвост прошлого кадра надо стереть");
+        assert!(out.starts_with("\x1b[?2026h\x1b[H"), "{out:?}");
+        assert!(out.ends_with("\x1b[?2026l"), "{out:?}");
         assert!(
             !out.contains("\x1b[2J"),
             "полная очистка вернула бы вспышку"
         );
-        // Каждая строка затирается по мере печати — иначе от длинной строки
-        // прошлого кадра остаётся хвост.
-        assert_eq!(out.matches("\x1b[K").count(), other.split("\r\n").count());
+        // Шлём только изменившиеся строки: в этих двух кадрах различается
+        // шапка, значит и печатается одна строка.
+        assert_eq!(out.matches("\x1b[K").count(), 1, "{out:?}");
+    }
+
+    /// Кадр стал короче — хвост прошлого надо стереть, и стирать его нужно от
+    /// конца последней строки, а не от её начала: иначе последняя строка
+    /// исчезает вместе с хвостом.
+    #[test]
+    fn a_shorter_frame_erases_the_tail_after_its_last_line() {
+        let long = "раз\r\nдва\r\nтри";
+        let short = "раз\r\nдва";
+        let out = repaint(short, long).expect("кадр изменился");
+        assert!(out.contains("\x1b[J"), "хвост не стёрт: {out:?}");
+        let tail = out.split("\x1b[J").next().unwrap_or_default();
+        assert!(tail.ends_with("два\x1b[K"), "стираем не от конца: {out:?}");
+        // Кадр вырос — стирать нечего.
+        let grew = repaint(long, short).expect("кадр изменился");
+        assert!(!grew.contains("\x1b[J"), "лишнее стирание: {grew:?}");
     }
 
     fn key(c: char) -> KeyEvent {
