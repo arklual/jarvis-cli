@@ -9,6 +9,7 @@
 //! остаётся тонкой оболочкой вокруг них.
 
 use crate::ui::style::{paint, rule, truncate, width, Caps, Role};
+use crossterm::event::{KeyCode, KeyModifiers};
 use std::io::{IsTerminal, Write};
 
 /// Диалог возможен только у живого терминала. В пайпе спрашивать некого:
@@ -172,7 +173,207 @@ pub fn number(caps: &Caps, q: &str, default: u64) -> Result<u64, String> {
 }
 
 /// Показать список и вернуть выбранный индекс.
+///
+/// Если терминал живой — выбираем стрелками, как в pi (SelectList): список
+/// перед глазами, набранное отбирает строки, Enter берёт. Ввод номера остаётся
+/// запасным путём — он нужен там, где стрелки не доедут (пайп, чужой терминал).
 pub fn choose(caps: &Caps, title: &str, items: &[Choice], default: usize) -> Result<usize, String> {
+    if interactive() {
+        if let Some(picked) = pick(caps, title, items, default)? {
+            return Ok(picked);
+        }
+        return Err("выбор отменён".into());
+    }
+    choose_by_number(caps, title, items, default)
+}
+
+/// Что делает клавиша в списке.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Pick {
+    Up,
+    Down,
+    Top,
+    Bottom,
+    Take,
+    Cancel,
+    Back,
+    Clear,
+    Type(char),
+}
+
+/// Раскладка списка. Отдельной функцией — чтобы проверять её тестом, а не
+/// глазами через pty.
+///
+/// Ctrl+N/Ctrl+P ходят по списку, Ctrl+J — это тот же Enter (в сыром режиме
+/// перевод строки приходит именно так), Ctrl+D — конец ввода, то есть отмена.
+/// Остальные сочетания с Ctrl молчат: раньше Ctrl+D добавлял в отбор букву «d»
+/// и список внезапно оказывался пустым.
+fn pick_act(code: KeyCode, mods: KeyModifiers) -> Option<Pick> {
+    let ctrl = mods.contains(KeyModifiers::CONTROL);
+    match code {
+        KeyCode::Up => Some(Pick::Up),
+        KeyCode::Down => Some(Pick::Down),
+        KeyCode::Home | KeyCode::PageUp => Some(Pick::Top),
+        KeyCode::End | KeyCode::PageDown => Some(Pick::Bottom),
+        KeyCode::Enter | KeyCode::Tab => Some(Pick::Take),
+        KeyCode::Esc => Some(Pick::Cancel),
+        KeyCode::Backspace => Some(Pick::Back),
+        KeyCode::Char(c) if ctrl => match c {
+            'n' => Some(Pick::Down),
+            'p' => Some(Pick::Up),
+            'j' | 'm' => Some(Pick::Take),
+            'c' | 'd' | 'g' => Some(Pick::Cancel),
+            'u' | 'w' => Some(Pick::Clear),
+            'a' => Some(Pick::Top),
+            'e' => Some(Pick::Bottom),
+            _ => None,
+        },
+        KeyCode::Char(c) => Some(Pick::Type(c)),
+        _ => None,
+    }
+}
+
+/// Интерактивный выбор: стрелки, отбор набором, Enter.
+///
+/// `Ok(None)` — человек передумал (Esc).
+fn pick(
+    caps: &Caps,
+    title: &str,
+    items: &[Choice],
+    default: usize,
+) -> Result<Option<usize>, String> {
+    use crossterm::event::{poll, read, Event};
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let raw = crossterm::terminal::enable_raw_mode().is_ok();
+    print!("\x1b[?25l");
+    let mut filter = String::new();
+    let mut at = default.min(items.len() - 1);
+    let mut drawn = 0usize;
+    let result = loop {
+        // Отбор по похожести — тот же, что в окне: человек набирает три буквы,
+        // а не листает двадцать строк.
+        let shown: Vec<usize> = (0..items.len())
+            .filter(|i| {
+                filter.is_empty()
+                    || crate::ui::slash::fuzzy_score(&filter, &items[*i].label).is_some()
+                    || crate::ui::slash::fuzzy_score(&filter, &items[*i].hint).is_some()
+            })
+            .collect();
+        if !shown.contains(&at) {
+            at = shown.first().copied().unwrap_or(0);
+        }
+        let mut out = String::new();
+        if drawn > 1 {
+            // Возвращаемся на начало прошлой отрисовки. Курсор стоит НА
+            // последней строке (после неё перевода нет), поэтому вверх идём
+            // на строку меньше — иначе список печатался бы заново каждый раз.
+            out.push_str(&format!("\r\x1b[{}A", drawn - 1));
+        } else {
+            out.push('\r');
+        }
+        out.push_str(&format!("{}\x1b[K\r\n", rule(caps, title)));
+        let mut lines = 1usize;
+        let room = 12.min(shown.len().max(1));
+        // Окно списка едет за выбранным: он обязан быть виден всегда, иначе
+        // стрелки двигают невидимое.
+        let pos = shown.iter().position(|i| *i == at).unwrap_or(0);
+        let from = pos.saturating_sub(room.saturating_sub(1));
+        for i in shown.iter().copied().skip(from).take(room) {
+            let c = &items[i];
+            let mark = if i == at { "▸" } else { " " };
+            let label = if i == at {
+                paint(caps, Role::Accent, &c.label)
+            } else {
+                paint(caps, Role::Text, &c.label)
+            };
+            let hint = if c.hint.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", paint(caps, Role::Dim, &truncate(&c.hint, 46)))
+            };
+            out.push_str(&format!("  {mark} {label}{hint}\x1b[K\r\n"));
+            lines += 1;
+        }
+        if shown.is_empty() {
+            out.push_str(&format!(
+                "  {}\x1b[K\r\n",
+                paint(caps, Role::Muted, "ничего не подходит")
+            ));
+            lines += 1;
+        }
+        out.push_str(&format!(
+            "  {}{}\x1b[K",
+            paint(
+                caps,
+                Role::Dim,
+                "↑↓ выбор · ↵ взять · esc отмена · набирай — отбор  "
+            ),
+            paint(caps, Role::Accent, &filter)
+        ));
+        // Список ужимается по мере отбора — хвост прошлого кадра надо стереть,
+        // иначе под однострочным списком остаётся висеть десяток чужих строк.
+        out.push_str("\x1b[J");
+        lines += 1;
+        print!("{out}");
+        let _ = std::io::stdout().flush();
+        drawn = lines;
+
+        if !poll(std::time::Duration::from_millis(200)).unwrap_or(false) {
+            continue;
+        }
+        let ev = match read() {
+            Ok(ev) => ev,
+            // Ввод кончился (труба закрылась) — читать дальше нечего, и крутить
+            // пустой цикл на закрытом stdin значит съесть ядро целиком.
+            Err(_) => break None,
+        };
+        let Event::Key(k) = ev else { continue };
+        match pick_act(k.code, k.modifiers) {
+            Some(Pick::Cancel) => break None,
+            Some(Pick::Take) => break Some(at),
+            Some(Pick::Up) => {
+                let pos = shown.iter().position(|i| *i == at).unwrap_or(0);
+                // По кругу: у списка из трёх пунктов «вверх» с первого должно
+                // приводить к последнему, а не упираться.
+                at = *shown
+                    .get(if pos == 0 {
+                        shown.len().saturating_sub(1)
+                    } else {
+                        pos - 1
+                    })
+                    .unwrap_or(&at);
+            }
+            Some(Pick::Down) => {
+                let pos = shown.iter().position(|i| *i == at).unwrap_or(0);
+                at = *shown.get((pos + 1) % shown.len().max(1)).unwrap_or(&at);
+            }
+            Some(Pick::Top) => at = shown.first().copied().unwrap_or(at),
+            Some(Pick::Bottom) => at = shown.last().copied().unwrap_or(at),
+            Some(Pick::Back) => {
+                filter.pop();
+            }
+            Some(Pick::Clear) => filter.clear(),
+            Some(Pick::Type(c)) => filter.push(c),
+            None => {}
+        }
+    };
+    print!("\x1b[?25h\r\n");
+    let _ = std::io::stdout().flush();
+    if raw {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+    Ok(result)
+}
+
+/// Запасной путь: номер строкой. Нужен, когда стрелки не доедут.
+fn choose_by_number(
+    caps: &Caps,
+    title: &str,
+    items: &[Choice],
+    default: usize,
+) -> Result<usize, String> {
     list(caps, title, items);
     loop {
         put(&question(caps, "номер", &(default + 1).to_string()));
@@ -316,5 +517,49 @@ mod tests {
         assert!(q.contains("Имя") && q.contains("[ночной обход]"), "{q}");
         assert!(q.ends_with(": "));
         assert!(!question(&caps(), "Цель", "").contains('['));
+    }
+
+    #[test]
+    fn control_keys_do_not_leak_letters_into_the_filter() {
+        // Конец ввода приходит как Ctrl+D; раньше он добавлял «d» в отбор и
+        // список схлопывался в «ничего не подходит».
+        assert_eq!(
+            pick_act(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            Some(Pick::Cancel)
+        );
+        assert_eq!(
+            pick_act(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            Some(Pick::Take)
+        );
+        assert_eq!(pick_act(KeyCode::Char('z'), KeyModifiers::CONTROL), None);
+        // Обычная буква — по-прежнему отбор.
+        assert_eq!(
+            pick_act(KeyCode::Char('d'), KeyModifiers::NONE),
+            Some(Pick::Type('d'))
+        );
+    }
+
+    #[test]
+    fn the_list_walks_by_arrows_and_by_emacs_keys() {
+        assert_eq!(
+            pick_act(KeyCode::Down, KeyModifiers::NONE),
+            Some(Pick::Down)
+        );
+        assert_eq!(
+            pick_act(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            Some(Pick::Down)
+        );
+        assert_eq!(
+            pick_act(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            Some(Pick::Up)
+        );
+        assert_eq!(
+            pick_act(KeyCode::PageUp, KeyModifiers::NONE),
+            Some(Pick::Top)
+        );
+        assert_eq!(
+            pick_act(KeyCode::Esc, KeyModifiers::NONE),
+            Some(Pick::Cancel)
+        );
     }
 }
