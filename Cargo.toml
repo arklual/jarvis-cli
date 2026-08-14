@@ -26,7 +26,9 @@ libc = "0.2"
 # укладывается в двести строк прямого вывода. crossterm нужен за малым:
 # размер терминала и чтение клавиш без Enter (альт-экран не берём — после
 # выхода человек должен видеть свою историю команд).
-crossterm = { version = "0.27", default-features = false, features = ["events"] }
+# bracketed-paste — не роскошь: без него вставленный кусок приезжает градом
+# нажатий, и первый же перевод строки уходит отправкой недописанного.
+crossterm = { version = "0.27", default-features = false, features = ["events", "bracketed-paste"] }
 
 [profile.release]
 lto = true

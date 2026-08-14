@@ -102,6 +102,16 @@ pub enum Act {
     /// Убрать выбранное (связку) — со вторым нажатием как подтверждением.
     Remove,
     /// Правка строки ввода.
+    WordLeft,
+    WordRight,
+    KillWordLeft,
+    KillWordRight,
+    KillToEnd,
+    Yank,
+    YankPop,
+    Undo,
+    /// Вставка из буфера обмена — приходит куском, а не по буквам.
+    Paste(String),
     Left,
     Right,
     Home,
@@ -123,11 +133,17 @@ pub fn map_key(view_is_text: bool, k: KeyEvent) -> Act {
     // Alt+клавиша терминал шлёт как ESC перед этой клавишей — то же, что
     // «нажали Esc, потом её». Считаем это Escape: иначе быстрый Esc перед
     // следующим нажатием слипается в Alt и молча превращается в букву.
-    // Alt+Enter — перевод строки внутри сообщения; проверяем ДО общего
-    // правила про Alt, иначе он превратится в Escape и сотрёт набранное.
+    // Alt-сочетания разбираем ДО общего правила про Alt: иначе они
+    // превращаются в Escape и стирают набранное.
     if k.modifiers.contains(KeyModifiers::ALT) {
         return match k.code {
             KeyCode::Enter => Act::Newline,
+            // Слова — как в readline: Alt+B/F ходят, Alt+D стирает вперёд,
+            // Alt+Y листает кольцо убитого.
+            KeyCode::Left | KeyCode::Char('b') => Act::WordLeft,
+            KeyCode::Right | KeyCode::Char('f') => Act::WordRight,
+            KeyCode::Char('d') => Act::KillWordRight,
+            KeyCode::Char('y') => Act::YankPop,
             _ => Act::Escape,
         };
     }
@@ -141,6 +157,12 @@ pub fn map_key(view_is_text: bool, k: KeyEvent) -> Act {
             KeyCode::Char('o') => Act::Newline,
             KeyCode::Char('a') => Act::Home,
             KeyCode::Char('e') => Act::End,
+            KeyCode::Char('w') => Act::KillWordLeft,
+            KeyCode::Char('k') => Act::KillToEnd,
+            KeyCode::Char('y') => Act::Yank,
+            // Ctrl+Z и Ctrl+_ — две привычные отмены; в терминале до нас
+            // доезжает то одна, то другая.
+            KeyCode::Char('z') | KeyCode::Char('_') => Act::Undo,
             // Ctrl+D намеренно НЕ «удалить символ»: этим кодом терминал
             // сообщает о конце ввода, и он прилетает сам, когда стдин
             // закрывается. Поймано следом нажатий: символ под курсором
@@ -340,11 +362,13 @@ pub async fn run(app: &App, machine_name: &str) -> Result<(), String> {
 
         // 1. Клавиши — первым делом: отклик важнее свежести данных.
         while poll(TICK).map_err(|e| e.to_string())? {
-            let Event::Key(k) = read().map_err(|e| e.to_string())? else {
-                continue;
+            let act = match read().map_err(|e| e.to_string())? {
+                Event::Key(k) => map_key(typing_now(&ui), k),
+                // Вставка приходит целым куском — так её и кладём в поле.
+                Event::Paste(text) => Act::Paste(text),
+                _ => continue,
             };
-            let act = map_key(typing_now(&ui), k);
-            keylog(&k, &act, &ui);
+            keylog_act(&act, &ui);
             if !handle(&mut ui, act, &client, &list, &caps, &tx).await {
                 drop(raw);
                 poller.abort();
@@ -493,7 +517,7 @@ async fn start_form(ui: &mut Ui, kind: Kind) {
 /// «Клавиша не работает» — жалоба, которую без записи не проверить: терминалы
 /// шлют одну и ту же клавишу по-разному, а часть кодов приходит сама (Ctrl+D
 /// при закрытии ввода). Один такой след уже нашёл здесь съеденную букву.
-fn keylog(k: &KeyEvent, act: &Act, ui: &Ui) {
+fn keylog_act(act: &Act, ui: &Ui) {
     let Ok(path) = std::env::var("JARVIS_KEYLOG") else {
         return;
     };
@@ -503,7 +527,7 @@ fn keylog(k: &KeyEvent, act: &Act, ui: &Ui) {
         .append(true)
         .open(path)
     {
-        let _ = writeln!(f, "{k:?} -> {act:?} | {:?}", ui.input.text());
+        let _ = writeln!(f, "{act:?} | {:?}", ui.input.text());
     }
 }
 
@@ -650,6 +674,14 @@ async fn handle(
         // вторую строку не поправить, не стерев её целиком.
         Act::Up if typing_now(ui) && ui.input.is_multiline() => ui.input.up(),
         Act::Down if typing_now(ui) && ui.input.is_multiline() => ui.input.down(),
+        // Однострочный ввод с набранным текстом или уже гуляющий по истории —
+        // это шелл: вверх поднимает прошлое отправленное.
+        Act::Up if ui.view == View::Chat && (!ui.input.is_empty() || ui.input.in_history()) => {
+            ui.input.history_prev();
+        }
+        Act::Down if ui.view == View::Chat && ui.input.in_history() => {
+            ui.input.history_next();
+        }
         Act::Up => match ui.view {
             View::List => ui.sel = ui.sel.saturating_sub(1),
             View::Chat => ui.scroll += 1,
@@ -948,6 +980,7 @@ async fn handle(
                     }
                     match client.reply(&pane, &text).await {
                         Ok(_) => {
+                            ui.input.remember(&text);
                             ui.input.clear();
                             ui.scroll = 0;
                             // Своё сообщение не дорисовываем: оно приедет из
@@ -962,6 +995,34 @@ async fn handle(
             }
         }
         Act::Type(c) => ui.input.insert(c),
+        Act::Paste(text) => {
+            // Вставка целиком: перевод строки внутри неё — текст, а не Enter.
+            // Иначе многострочная вставка отправляла бы первую строку.
+            ui.input.paste(&text);
+            if ui.typing == Typing::None {
+                ui.typing = idle_typing(ui);
+            }
+        }
+        Act::WordLeft => ui.input.word_left(),
+        Act::WordRight => ui.input.word_right(),
+        Act::KillWordLeft => ui.input.kill_word_left(),
+        Act::KillWordRight => ui.input.kill_word_right(),
+        Act::KillToEnd => ui.input.kill_to_end(),
+        Act::Yank => {
+            if !ui.input.yank() {
+                ui.status = "нечего возвращать: кольцо пусто".into();
+            }
+        }
+        Act::YankPop => {
+            if !ui.input.yank_pop() {
+                ui.status = "в кольце одно значение".into();
+            }
+        }
+        Act::Undo => {
+            if !ui.input.undo() {
+                ui.status = "отменять нечего".into();
+            }
+        }
         Act::Left => ui.input.left(),
         Act::Right => ui.input.right(),
         Act::Home => ui.input.home(),
@@ -1645,9 +1706,11 @@ fn keys_hint(caps: &Caps, ui: &Ui) -> String {
         View::Chat => vec![
             ("↵", "отправить"),
             ("alt+↵", "новая строка"),
-            ("←→", "курсор"),
+            ("↑↓", "прошлые"),
+            ("^w", "стереть слово"),
+            ("^y", "вернуть"),
+            ("^z", "отменить"),
             ("/", "команда"),
-            ("↑↓", "прокрутка"),
             ("esc", "назад"),
         ],
         View::Bundles => vec![
@@ -2087,6 +2150,10 @@ impl RawGuard {
         // Курсор прячем на всё время окна: рисуя кадр, он пробегает по экрану
         // и оставляет за собой мерцающий след — самая заметная часть «ряби».
         print!("\x1b[?25l");
+        // Скобочная вставка: терминал обрамляет вставленный кусок метками, и
+        // мы получаем его ОДНИМ событием. Без неё вставка приезжает как град
+        // нажатий, и первый же перевод строки уходит отправкой недописанного.
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
         let _ = std::io::stdout().flush();
         Self(crossterm::terminal::enable_raw_mode().is_ok())
     }
@@ -2094,6 +2161,7 @@ impl RawGuard {
 
 impl Drop for RawGuard {
     fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
         if self.0 {
             let _ = crossterm::terminal::disable_raw_mode();
         }
