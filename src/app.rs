@@ -108,7 +108,7 @@ pub async fn run(parsed: Parsed) -> Result<(), String> {
     let app = App::new(parsed.json);
     match parsed.cmd {
         Cmd::Help => {
-            println!("{}", crate::cli::HELP);
+            print!("{}", crate::cli::help(&app.caps));
             Ok(())
         }
         Cmd::Version => {

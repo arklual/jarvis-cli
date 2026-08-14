@@ -136,51 +136,141 @@ pub struct Parsed {
     pub json: bool,
 }
 
-pub const HELP: &str = "\
-jarvis — агенты, циклы и связка прямо в терминале
+/// Строка справки: заголовок раздела, пара «команда — что делает» или
+/// примечание.
+///
+/// Таблицей, а не готовым текстом: выравнивание описаний считается по самой
+/// длинной команде, и добавленная команда не заставляет переставлять пробелы
+/// во всём файле — раньше три строки из-за этого стояли вкось.
+pub enum Help {
+    Gap,
+    Head(&'static str),
+    Cmd(&'static str, &'static str),
+    Note(&'static str),
+}
 
-  jarvis                     живой экран: кто работает, кто спрашивает
-  jarvis ls                  список сессий разово
-  jarvis reply <id> <текст>  ответить агенту
-  jarvis answer <id> <n>     ответить на вопрос вариантом n
-  jarvis stop <id>           прервать агента
-  jarvis screen <id>         показать экран сессии
-  jarvis chat <id> [-f]      лента чата; -f — следить вживую
-  jarvis projects            проекты машины
-  jarvis cmd <id> /model …   слэш-команда пульта в сессию
-  jarvis machines            машины и связь с ними
-  jarvis machine add <имя> <user@host>   добавить машину
-  jarvis machine rm <имя>    убрать машину
-  jarvis run <каталог>       поднять агента в каталоге
-  jarvis limits              лимиты аккаунта
+pub fn help_rows() -> &'static [Help] {
+    use Help::*;
+    &[
+        Cmd("jarvis", "живой экран: кто работает, кто спрашивает"),
+        Cmd("jarvis ls", "список сессий разово"),
+        Cmd("jarvis reply <id> <текст>", "ответить агенту"),
+        Cmd("jarvis answer <id> <n>", "ответить на вопрос вариантом n"),
+        Cmd("jarvis stop <id>", "прервать агента"),
+        Cmd("jarvis screen <id>", "показать экран сессии"),
+        Cmd("jarvis chat <id> [-f]", "лента чата; -f — следить вживую"),
+        Cmd("jarvis projects", "проекты машины"),
+        Cmd("jarvis cmd <id> /model …", "слэш-команда пульта в сессию"),
+        Cmd("jarvis machines", "машины и связь с ними"),
+        Cmd("jarvis machine add <имя> <user@host>", "добавить машину"),
+        Cmd("jarvis machine rm <имя>", "убрать машину"),
+        Cmd("jarvis run <каталог>", "поднять агента в каталоге"),
+        Cmd("jarvis limits", "лимиты аккаунта"),
+        Gap,
+        Head("Циклы — рутина, которую агент крутит сам"),
+        Cmd("jarvis loop new", "завести цикл — с каталогом заготовок"),
+        Cmd("jarvis loop ls", "какие циклы есть и что с ними"),
+        Cmd("jarvis loop show <id>", "журнал итераций цикла"),
+        Cmd("jarvis loop start <id>", "запустить цикл"),
+        Cmd("jarvis loop stop <id>", "остановить цикл"),
+        Cmd(
+            "jarvis loop say <id> <текст>",
+            "ответить циклу на его вопрос",
+        ),
+        Cmd(
+            "jarvis loop presets",
+            "каталог заготовок: источники задач и гейты",
+        ),
+        Cmd("jarvis loop rm <id>", "убрать цикл"),
+        Gap,
+        Head("Связки — несколько агентов над одним проектом"),
+        Cmd("jarvis bundle new", "завести связку"),
+        Cmd("jarvis bundle ls", "какие связки есть и что с ними"),
+        Cmd(
+            "jarvis bundle show <id>",
+            "пульт связки: руки, очередь слияний",
+        ),
+        Cmd(
+            "jarvis bundle hand <id> <задача>",
+            "добавить руку и поднять её агента",
+        ),
+        Cmd("jarvis bundle merge <id> <рука>", "влить голову очереди"),
+        Cmd("jarvis bundle pause <id>", "пауза всем рукам"),
+        Cmd(
+            "jarvis bundle rm <id>",
+            "убрать связку (--clean — снести и worktree рук)",
+        ),
+        Gap,
+        Cmd("jarvis notify", "печатать события по мере появления"),
+        Gap,
+        Head("Общие флаги"),
+        Cmd("-m, --machine <имя>", "где работать: local или имя узла"),
+        Cmd("    --json", "машинный вывод вместо человеческого"),
+        Cmd("-h, --help", "эта справка"),
+        Cmd("-V, --version", "версия"),
+        Gap,
+        Note(
+            "Сессию можно называть началом её идентификатора или именем проекта — \
+             достаточно, чтобы совпадение было одно.",
+        ),
+    ]
+}
 
-  jarvis loop new            завести цикл — с каталогом заготовок
-  jarvis loop ls             циклы: рутина, которую агент крутит сам
-  jarvis loop show <id>      журнал итераций цикла
-  jarvis loop start <id>     запустить цикл
-  jarvis loop stop <id>      остановить цикл
-  jarvis loop say <id> <текст>  ответить циклу на его вопрос
-  jarvis loop presets        каталог заготовок: источники задач и гейты
-  jarvis loop rm <id>        убрать цикл
-
-  jarvis bundle new          завести связку
-  jarvis bundle ls           связки: несколько агентов над одним проектом
-  jarvis bundle show <id>    пульт связки: руки, очередь слияний
-  jarvis bundle hand <id> <задача>  добавить руку и поднять её агента
-  jarvis bundle merge <id> <рука>   влить голову очереди
-  jarvis bundle pause <id>   пауза всем рукам
-  jarvis bundle rm <id>      убрать связку (--clean — снести и worktree рук)
-
-  jarvis notify              печатать события по мере появления
-
-Общие флаги:
-  -m, --machine <имя>        где работать: local или имя узла (по умолчанию local)
-      --json                 машинный вывод вместо человеческого
-  -h, --help                 эта справка
-  -V, --version              версия
-
-Сессию можно называть началом её идентификатора или именем проекта —
-достаточно, чтобы совпадение было одно.";
+/// Справка целиком — как её видит человек.
+///
+/// Описания выровнены по колонке, команды выделены, примечания приглушены и
+/// перенесены по ширине окна. Раньше это была строка с пробелами руками.
+pub fn help(caps: &crate::ui::style::Caps) -> String {
+    use crate::ui::style::{pad, paint, wrap, Role};
+    let total = (caps.width as usize).max(40);
+    let col = help_rows()
+        .iter()
+        .filter_map(|r| match r {
+            Help::Cmd(name, _) => Some(crate::ui::style::width(name)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(28)
+        .min(total.saturating_sub(24));
+    let mut out = format!(
+        "{} {}\n",
+        paint(caps, Role::Accent, "jarvis"),
+        paint(
+            caps,
+            Role::Dim,
+            "— агенты, циклы и связка прямо в терминале"
+        )
+    );
+    for row in help_rows() {
+        match row {
+            Help::Gap => out.push('\n'),
+            Help::Head(t) => out.push_str(&format!("{}\n", paint(caps, Role::Text, t))),
+            Help::Cmd(name, what) => {
+                let room = total.saturating_sub(col + 4);
+                if room < 24 {
+                    // Узкое окно: описание уходит под команду. Обрезанное до
+                    // «машинный вывод вмес…» описание не описывает ничего.
+                    out.push_str(&format!("  {}\n", paint(caps, Role::Accent, name)));
+                    for line in wrap(what, total.saturating_sub(6)) {
+                        out.push_str(&format!("      {}\n", paint(caps, Role::Dim, &line)));
+                    }
+                } else {
+                    out.push_str(&format!(
+                        "  {}  {}\n",
+                        pad(&paint(caps, Role::Accent, name), col),
+                        paint(caps, Role::Dim, &crate::ui::style::truncate(what, room))
+                    ));
+                }
+            }
+            Help::Note(t) => {
+                for line in wrap(t, total.saturating_sub(2)) {
+                    out.push_str(&format!("{}\n", paint(caps, Role::Dim, &line)));
+                }
+            }
+        }
+    }
+    out
+}
 
 /// Разобрать аргументы (без имени программы).
 pub fn parse(args: &[String]) -> Result<Parsed, String> {
@@ -523,11 +613,38 @@ mod tests {
 
     #[test]
     fn help_mentions_every_command() {
+        let text = help(&crate::ui::style::Caps {
+            color: false,
+            theme: crate::ui::style::Theme::Dark,
+            truecolor: false,
+            unicode: true,
+            width: 100,
+        });
         for word in [
             "reply", "answer", "loop", "bundle", "limits", "notify", "screen", "chat", "projects",
         ] {
-            assert!(HELP.contains(word), "справка молчит про {word}");
+            assert!(text.contains(word), "справка молчит про {word}");
         }
+        // Описания стоят одной колонкой: раньше три длинные команды сбивали
+        // выравнивание, и справка читалась как черновик.
+        let starts: Vec<usize> = text
+            .lines()
+            .filter(|l| l.starts_with("  jarvis "))
+            .filter_map(|l| {
+                // Считаем в ЯЧЕЙКАХ, а не в байтах: «<текст>» кириллицей
+                // сдвигает байтовое смещение, и ровная колонка выглядела бы
+                // кривой.
+                let body = &l[2..];
+                let gap = body.find("  ")?;
+                let spaces = body[gap..].chars().take_while(|c| *c == ' ').count();
+                Some(2 + crate::ui::style::width(&body[..gap]) + spaces)
+            })
+            .collect();
+        let first = starts.first().copied().unwrap_or(0);
+        assert!(
+            starts.len() > 20 && starts.iter().all(|s| *s == first),
+            "описания встали вкось: {starts:?}"
+        );
     }
 
     #[test]
