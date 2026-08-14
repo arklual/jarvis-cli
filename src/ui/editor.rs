@@ -133,6 +133,20 @@ impl Editor {
 
     /// Перевод строки внутри сообщения: длинную мысль пишут в несколько строк,
     /// и Enter, отправляющий недописанное, — главный способ это испортить.
+    /// Обратная косая перед кареткой означает «перенеси строку, не отправляй».
+    ///
+    /// Приём из pi (и из шелла): Shift+Enter доезжает не в каждом терминале, и
+    /// там, где не доехал, человеку нужен способ добавить строку одними
+    /// буквами. Косую при этом съедаем — она была командой, а не текстом.
+    pub fn backslash_newline(&mut self) -> bool {
+        if !self.text[..self.cursor].ends_with('\\') {
+            return false;
+        }
+        self.snapshot();
+        self.text.replace_range(self.cursor - 1..self.cursor, "\n");
+        true
+    }
+
     pub fn newline(&mut self) {
         self.insert('\n');
     }
@@ -714,5 +728,25 @@ mod tests {
     fn empty_means_nothing_but_spaces() {
         assert!(ed("   \n ").is_empty());
         assert!(!ed(" x ").is_empty());
+    }
+    /// Косая перед кареткой превращает Enter в перенос строки — и исчезает
+    /// сама: она была командой, а не текстом.
+    #[test]
+    fn a_backslash_turns_enter_into_a_line_break() {
+        let mut e = Editor::default();
+        e.set("первая строка \\");
+        assert!(e.backslash_newline());
+        assert_eq!(e.text(), "первая строка \n");
+        // Без косой Enter остаётся отправкой.
+        let mut e = Editor::default();
+        e.set("просто текст");
+        assert!(!e.backslash_newline());
+        assert_eq!(e.text(), "просто текст");
+        // Отмена возвращает косую: это была правка, а не побочный эффект.
+        let mut e = Editor::default();
+        e.set("текст \\");
+        e.backslash_newline();
+        assert!(e.undo());
+        assert_eq!(e.text(), "текст \\");
     }
 }

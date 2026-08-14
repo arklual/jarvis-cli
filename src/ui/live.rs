@@ -79,6 +79,8 @@ enum View {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Act {
     Quit,
+    /// Ctrl+C: сперва стереть набранное, и только пустым — выйти.
+    Break,
     Up,
     Down,
     Open,
@@ -165,7 +167,7 @@ pub fn map_key(view_is_text: bool, k: KeyEvent) -> Act {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     if ctrl {
         return match k.code {
-            KeyCode::Char('c') => Act::Quit,
+            KeyCode::Char('c') => Act::Break,
             KeyCode::Char('u') => Act::KillLine,
             // Терминалы, где Alt+Enter не доходит, оставляют Ctrl+O — это
             // общий для readline способ сказать «перевод строки».
@@ -268,6 +270,11 @@ struct Ui {
     scroll: usize,
     /// Прокрутка справки, считаемая от её начала.
     help_at: usize,
+    /// Когда последний раз нажали Ctrl+C: второй раз подряд закрывает окно.
+    break_at: i64,
+    /// До какого момента держим приветствие. Оно сказано один раз и не должно
+    /// навсегда занимать строку, где живут лимиты.
+    greet_until: i64,
     /// Дополнение упоминания по кругу: где «@», что набрали до первого Tab и
     /// который из кандидатов сейчас подставлен.
     ///
@@ -328,6 +335,8 @@ impl Default for Ui {
             scroll: 0,
             help_at: 0,
             tab_cycle: None,
+            break_at: 0,
+            greet_until: 0,
             feed: None,
             items: Vec::new(),
             open_id: String::new(),
@@ -380,6 +389,16 @@ pub async fn run(app: &App, machine_name: &str) -> Result<(), String> {
         bundles: state::load_bundles(),
         loops: state::load_loops(),
         disk_at: now_ms(),
+        // Первая строка состояния отвечает на «что это и с чем оно
+        // разговаривает»: версия и узел. Уйдёт при первом же действии — как
+        // приветствие в pi, которое живёт до первой команды.
+        status: format!(
+            "jarvis {} · узел {} · {} — справка",
+            env!("CARGO_PKG_VERSION"),
+            m.name,
+            if app.caps.unicode { "?" } else { "h" }
+        ),
+        greet_until: now_ms() + 8_000,
         ..Default::default()
     };
     let mut list = session::sorted(&reg);
@@ -409,6 +428,12 @@ pub async fn run(app: &App, machine_name: &str) -> Result<(), String> {
         // перерисовывался бы вхолостую двенадцать раз в секунду.
         if ui.busy.is_some() {
             ui.tick = ui.tick.wrapping_add(1);
+        }
+        // Приветствие живёт восемь секунд: прочитать успеваешь, а строку
+        // лимитов оно после этого не занимает.
+        if ui.greet_until > 0 && now_ms() > ui.greet_until {
+            ui.greet_until = 0;
+            ui.status.clear();
         }
         present(&frame(&caps, &m.name, &ui, &list, rows), &mut shown);
 
@@ -898,8 +923,35 @@ async fn handle(
     if act != Act::Tab {
         ui.tab_cycle = None;
     }
+    // Первое же действие означает, что приветствие прочитано.
+    if ui.greet_until > 0 {
+        ui.greet_until = 0;
+        ui.status.clear();
+    }
+    // Косая черта перед кареткой означает «перенеси строку», а не «отправь»:
+    // Shift+Enter доезжает не в каждом терминале, и без этого приёма
+    // многострочное сообщение там набрать нечем.
+    if act == Act::Send && typing_now(ui) && ui.input.backslash_newline() {
+        return true;
+    }
     match act {
         Act::Quit => return false,
+        // Ctrl+C в окне — не «выход», а «отмена», как в pi и в шелле: сперва
+        // он забирает набранное, и только на пустой строке, дважды подряд,
+        // закрывает окно. Одно случайное нажатие не должно стоить человеку
+        // недописанного сообщения.
+        Act::Break => {
+            let now = now_ms();
+            if typing_now(ui) && !ui.input.is_empty() {
+                ui.input.clear();
+                ui.status = "стёрто · ещё раз Ctrl+C — выход".into();
+            } else if now - ui.break_at < 2000 {
+                return false;
+            } else {
+                ui.status = "ещё раз Ctrl+C — выход".into();
+            }
+            ui.break_at = now;
+        }
         // Отмена набора — отдельный шаг: Esc в наборе не должен ещё и
         // выбрасывать из вида, где человек стоит.
         Act::Escape if ui.confirm_rm.is_some() => {
@@ -939,9 +991,25 @@ async fn handle(
             }
         },
         // В многострочном сообщении стрелки принадлежат курсору: иначе
-        // вторую строку не поправить, не стерев её целиком.
-        Act::Up if typing_now(ui) && ui.input.is_multiline() => ui.input.up(),
-        Act::Down if typing_now(ui) && ui.input.is_multiline() => ui.input.down(),
+        // вторую строку не поправить, не стерев её целиком. Но на верхней
+        // строке вверх уже некуда — там стрелка снова означает историю, как в
+        // pi; по дороге она заходит в начало строки.
+        Act::Up if typing_now(ui) && ui.input.is_multiline() && ui.input.row_col().0 > 0 => {
+            ui.input.up()
+        }
+        Act::Up if typing_now(ui) && ui.input.is_multiline() && ui.input.row_col().1 > 0 => {
+            ui.input.home()
+        }
+        Act::Down
+            if typing_now(ui)
+                && ui.input.is_multiline()
+                && ui.input.row_col().0 + 1 < ui.input.lines().len() =>
+        {
+            ui.input.down()
+        }
+        Act::Down if typing_now(ui) && ui.input.is_multiline() && !ui.input.in_history() => {
+            ui.input.end()
+        }
         // Однострочный ввод с набранным текстом или уже гуляющий по истории —
         // это шелл: вверх поднимает прошлое отправленное.
         Act::Up if ui.view == View::Chat && (!ui.input.is_empty() || ui.input.in_history()) => {
@@ -1946,12 +2014,7 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
     }
 
     push(&mut out, "");
-    if ui.view == View::List && ui.busy.is_none() {
-        push(
-            &mut out,
-            &format!(" {}", render::limits_line(caps, &ui.limits)),
-        );
-    } else if let Some((what, since)) = ui.busy.as_ref() {
+    if let Some((what, since)) = ui.busy.as_ref() {
         // Пока идёт чужая долгая работа, строка состояния отвечает сразу на два
         // вопроса: живое ли оно и сколько уже тянется.
         push(
@@ -1968,9 +2031,16 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
             ),
         );
     } else if !ui.status.is_empty() {
+        // Сказанное человеку важнее постоянного фона: лимиты никуда не денутся,
+        // а «ещё раз Ctrl+C — выход» нужно прочитать сейчас.
         push(
             &mut out,
             &format!(" {}", paint(caps, Role::Muted, &ui.status)),
+        );
+    } else if ui.view == View::List {
+        push(
+            &mut out,
+            &format!(" {}", render::limits_line(caps, &ui.limits)),
         );
     } else {
         push(&mut out, "");
@@ -2742,7 +2812,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("s", "экран сессии как есть"),
                 ("Esc", "назад"),
                 ("? / h", "эта справка"),
-                ("q / Ctrl-C", "выход"),
+                ("q", "выход (Ctrl-C — дважды)"),
             ],
         ),
         (
@@ -3465,13 +3535,14 @@ mod tests {
         );
     }
 
-    /// Ctrl-C обязан работать везде: в сыром режиме сигнала нет, и без этой
-    /// ветки человек остался бы запертым в окне.
+    /// Ctrl-C обязан доезжать везде: в сыром режиме сигнала нет, и без этой
+    /// ветки человек остался бы запертым в окне. Но выходом он становится не
+    /// сразу — сперва забирает набранное.
     #[test]
-    fn ctrl_c_quits_from_anywhere() {
+    fn ctrl_c_cancels_first_and_quits_second() {
         let c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(map_key(false, c), Act::Quit);
-        assert_eq!(map_key(true, c), Act::Quit);
+        assert_eq!(map_key(false, c), Act::Break);
+        assert_eq!(map_key(true, c), Act::Break);
     }
 
     /// ESC перед клавишей приезжает как Alt: это по-прежнему «назад», а не
@@ -3592,5 +3663,21 @@ mod tests {
             Some(("src/".to_string(), Some(0)))
         );
         assert_eq!(mention_pick("sr", &[], None), None);
+    }
+    /// Ctrl+C сперва забирает набранное и лишь потом закрывает окно: одно
+    /// случайное нажатие не должно стоить недописанного сообщения.
+    #[tokio::test]
+    async fn ctrl_c_takes_the_draft_before_it_takes_the_window() {
+        let mut ui = ui_in(View::Chat, Typing::Message);
+        ui.input.set("почти дописал");
+        assert!(press(&mut ui, Act::Break).await, "окно закрылось сразу");
+        assert!(ui.input.is_empty(), "набранное осталось");
+        assert!(ui.status.contains("ещё раз"), "нет предупреждения");
+        // Второй раз подряд — это уже «выход», как в pi.
+        assert!(!press(&mut ui, Act::Break).await, "второй раз не закрыл");
+        // А по одиночке, на пустой строке, он только предупреждает.
+        let mut ui = ui_in(View::Chat, Typing::Message);
+        assert!(press(&mut ui, Act::Break).await, "закрылось с первого раза");
+        assert!(ui.status.contains("ещё раз"));
     }
 }
