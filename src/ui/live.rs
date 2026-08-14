@@ -123,6 +123,11 @@ pub enum Act {
     Tab,
     /// Начать команду с «/».
     Slash,
+    /// Открыть набранное во внешнем редакторе.
+    Editor,
+    /// В начало и конец ленты.
+    Top,
+    Bottom,
     None,
 }
 
@@ -163,6 +168,9 @@ pub fn map_key(view_is_text: bool, k: KeyEvent) -> Act {
             // Ctrl+Z и Ctrl+_ — две привычные отмены; в терминале до нас
             // доезжает то одна, то другая.
             KeyCode::Char('z') | KeyCode::Char('_') => Act::Undo,
+            // Ctrl+X — как ^X^E в шелле: длинный промт пишут в редакторе, а не
+            // в однострочном поле вслепую.
+            KeyCode::Char('x') => Act::Editor,
             // Ctrl+D намеренно НЕ «удалить символ»: этим кодом терминал
             // сообщает о конце ввода, и он прилетает сам, когда стдин
             // закрывается. Поймано следом нажатий: символ под курсором
@@ -193,6 +201,8 @@ pub fn map_key(view_is_text: bool, k: KeyEvent) -> Act {
         KeyCode::Down => Act::Down,
         KeyCode::Left => Act::Left,
         KeyCode::Right => Act::Right,
+        KeyCode::Home if !view_is_text => Act::Top,
+        KeyCode::End if !view_is_text => Act::Bottom,
         KeyCode::Home => Act::Home,
         KeyCode::End => Act::End,
         KeyCode::Delete => Act::Delete,
@@ -266,6 +276,9 @@ struct Ui {
     /// Где мы работаем: связка заводится на этой же машине, руки поднимутся
     /// там же, где за ними смотрят.
     machine: String,
+    /// Экран надо перерисовать начисто: под нами кто-то писал (внешний
+    /// редактор), и прошлый кадр больше не описывает то, что на экране.
+    redraw: bool,
     /// Счётчик кадров — им крутится спиннер.
     tick: u64,
     /// Что уже просили убрать: второе нажатие подтверждает.
@@ -314,6 +327,7 @@ impl Default for Ui {
             confirm_rm: None,
             form: None,
             busy: None,
+            redraw: false,
             tick: 0,
         }
     }
@@ -355,6 +369,11 @@ pub async fn run(app: &App, machine_name: &str) -> Result<(), String> {
             width: cols,
             ..app.caps
         };
+        if ui.redraw {
+            ui.redraw = false;
+            shown.clear();
+            print!("\x1b[2J");
+        }
         if (cols, rows) != was_size {
             // Окно изменили: прошлый кадр больше ни о чём не говорит, а на
             // экране остались куски старой раскладки — рисуем начисто.
@@ -802,6 +821,20 @@ async fn handle(
             }
             _ => {}
         },
+        Act::Top => ui.scroll = usize::MAX / 2,
+        Act::Bottom => ui.scroll = 0,
+        Act::Editor => {
+            let text = ui.input.text().to_string();
+            match external_editor(&text).await {
+                Ok(Some(edited)) => {
+                    ui.input.set(edited);
+                    ui.status = "принял из редактора".into();
+                }
+                Ok(None) => ui.status = "редактор ничего не изменил".into(),
+                Err(e) => ui.status = e,
+            }
+            ui.redraw = true;
+        }
         Act::PageUp => ui.scroll += 10,
         Act::PageDown => ui.scroll = ui.scroll.saturating_sub(10),
         Act::Open if ui.view == View::Loops => {
@@ -1801,6 +1834,58 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
     out
 }
 
+/// Открыть набранное во внешнем редакторе и забрать обратно.
+///
+/// Длинный промт в однострочном поле пишут вслепую: не видно ни начала, ни
+/// структуры. `$EDITOR` знает и то и другое — тот же приём, что у pi
+/// (external-editor.ts) и у шелла с ^X^E.
+///
+/// Терминал на это время отдаём редактору целиком: сырой режим и скобочную
+/// вставку снимаем, иначе vim получит наши настройки и будет вести себя дико.
+async fn external_editor(text: &str) -> Result<Option<String>, String> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let dir = std::env::temp_dir().join(format!("jarvis-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("не создал временный каталог: {e}"))?;
+    // Расширение .md не случайно: редакторы включают перенос и подсветку, а
+    // промт — это текст, а не код.
+    let path = dir.join("prompt.md");
+    std::fs::write(&path, text).map_err(|e| format!("не записал черновик: {e}"))?;
+
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+    let _ = crossterm::terminal::disable_raw_mode();
+    print!("\x1b[?25h\x1b[2J\x1b[H");
+    let _ = std::io::stdout().flush();
+
+    let mut parts = editor.split_whitespace();
+    let bin = parts.next().unwrap_or("vi").to_string();
+    let args: Vec<String> = parts.map(str::to_string).collect();
+    let status = tokio::process::Command::new(&bin)
+        .args(&args)
+        .arg(&path)
+        .status()
+        .await;
+
+    let _ = crossterm::terminal::enable_raw_mode();
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    print!("\x1b[?25l");
+    let _ = std::io::stdout().flush();
+
+    match status {
+        Ok(s) if s.success() => {
+            let back = std::fs::read_to_string(&path).unwrap_or_default();
+            let _ = std::fs::remove_file(&path);
+            // Хвостовой перевод строки редакторы дописывают сами — он не часть
+            // сообщения.
+            let back = back.trim_end_matches('\n').to_string();
+            Ok((back != text).then_some(back))
+        }
+        Ok(_) => Ok(None),
+        Err(e) => Err(format!("не запустился {bin}: {e}")),
+    }
+}
+
 /// Сколько строк ввода показываем. Длинный промт не должен съедать ленту
 /// целиком: восемь строк — это абзац, дальше человек и сам не видит начала.
 const INPUT_ROWS: usize = 8;
@@ -1912,6 +1997,7 @@ fn keys_hint(caps: &Caps, ui: &Ui) -> String {
         View::Chat => vec![
             ("↵", "отправить"),
             ("alt+↵", "новая строка"),
+            ("^x", "редактор"),
             ("↑↓", "прошлые"),
             ("^w", "стереть слово"),
             ("^y", "вернуть"),
@@ -2015,7 +2101,11 @@ fn draw_chat(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
     if ui.scroll > 0 {
         push(
             out,
-            &paint(caps, Role::Dim, &format!(" ↑ прокручено на {}", ui.scroll)),
+            &paint(
+                caps,
+                Role::Dim,
+                &format!(" ↑ прокручено на {} · end — к свежему", ui.scroll.min(9999)),
+            ),
         );
     }
 }
