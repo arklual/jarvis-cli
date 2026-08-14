@@ -303,6 +303,25 @@ pub fn paint(caps: &Caps, role: Role, text: &str) -> String {
     }
 }
 
+/// Краска вместе с начертанием: жирное, курсив, зачёркнутое.
+///
+/// Одной последовательностью, а не вложенными: вложенный сброс погасил бы
+/// цвет снаружи, и остаток строки поехал бы не тем тоном.
+pub fn accent(caps: &Caps, role: Role, attrs: &[u8], text: &str) -> String {
+    if !caps.color || text.is_empty() {
+        return text.to_string();
+    }
+    let mut codes: Vec<String> = attrs.iter().map(|a| a.to_string()).collect();
+    if let Role::Plain = role {
+    } else if let Some(c) = rgb(caps.theme, role) {
+        codes.push(sgr(caps, c, false));
+    }
+    if codes.is_empty() {
+        return text.to_string();
+    }
+    format!("\x1b[{}m{text}\x1b[0m", codes.join(";"))
+}
+
 /// Жирным — там, где важен вес, а не цвет.
 pub fn bold(caps: &Caps, text: &str) -> String {
     if !caps.color || text.is_empty() {
@@ -348,32 +367,53 @@ pub fn wrap(text: &str, max: usize) -> Vec<String> {
     }
     let mut out: Vec<String> = Vec::new();
     for para in text.split('\n') {
+        // Краска переживает перенос: если строку разорвало посреди жирного
+        // куска, продолжение обязано остаться жирным, а конец строки — закрыть
+        // краску, чтобы она не потекла на подложку соседа.
+        let mut open = String::new();
         let mut line = String::new();
+        let close = |line: &mut String, out: &mut Vec<String>, open: &str| {
+            let done = std::mem::take(line);
+            if open.is_empty() {
+                out.push(done);
+            } else {
+                out.push(format!("{done}\x1b[0m"));
+            }
+        };
         for word in para.split_whitespace() {
             let w = width(word);
             if line.is_empty() {
+                line.push_str(&open);
                 // Слово длиннее строки (путь, ссылка) рвём по месту: иначе оно
                 // одно растянет верстку и всё поедет.
                 if w > max {
                     let mut rest = word.to_string();
                     while width(&rest) > max {
                         let head: String = take_width(&rest, max);
-                        out.push(head.clone());
                         rest = rest[head.len()..].to_string();
+                        open = sgr_open(&open, &head);
+                        line.push_str(&head);
+                        close(&mut line, &mut out, &open);
+                        line.push_str(&open);
                     }
-                    line = rest;
+                    line.push_str(&rest);
+                    open = sgr_open(&open, &rest);
                 } else {
-                    line = word.to_string();
+                    line.push_str(word);
+                    open = sgr_open(&open, word);
                 }
             } else if width(&line) + 1 + w <= max {
                 line.push(' ');
                 line.push_str(word);
+                open = sgr_open(&open, word);
             } else {
-                out.push(std::mem::take(&mut line));
-                line = word.to_string();
+                close(&mut line, &mut out, &open);
+                line.push_str(&open);
+                line.push_str(word);
+                open = sgr_open(&open, word);
             }
         }
-        out.push(line);
+        close(&mut line, &mut out, &open);
     }
     if out.is_empty() {
         out.push(String::new());
@@ -381,16 +421,39 @@ pub fn wrap(text: &str, max: usize) -> Vec<String> {
     out
 }
 
+/// Какая краска остаётся включённой после куска текста.
+///
+/// Считаем грубо, но верно для того, что печатаем сами: сброс `ESC[0m` гасит
+/// всё, любая другая последовательность — накапливается. Этого хватает, чтобы
+/// перенесённая строка начиналась в том же цвете, в каком оборвалась.
+fn sgr_open(before: &str, chunk: &str) -> String {
+    let mut open = before.to_string();
+    for (w, text) in clusters(chunk) {
+        if w > 0 || !text.starts_with('\x1b') {
+            continue;
+        }
+        if text == "\x1b[0m" || text == "\x1b[m" {
+            open.clear();
+        } else if text.ends_with('m') {
+            open.push_str(text);
+        }
+    }
+    open
+}
+
 /// Взять с начала строки ровно `max` ячеек, не разрывая символ.
 fn take_width(s: &str, max: usize) -> String {
     let mut out = String::new();
     let mut w = 0;
-    for c in s.chars() {
-        let cw = char_width(c);
+    for (cw, text) in clusters(s) {
+        if cw == 0 {
+            out.push_str(text);
+            continue;
+        }
         if w + cw > max {
             break;
         }
-        out.push(c);
+        out.push_str(text);
         w += cw;
     }
     out
@@ -1107,5 +1170,40 @@ mod tests {
         assert!(cut.ends_with("\x1b[0m"), "краска не закрыта: {cut:?}");
         // Некрашеная строка остаётся некрашеной.
         assert_eq!(truncate("абвгде", 4), "абв…");
+    }
+    /// Перенос не должен ронять краску: разорванный жирный кусок обязан
+    /// остаться жирным на второй строке, а первая — закрыться, иначе цвет
+    /// потечёт на соседнюю подложку.
+    #[test]
+    fn wrapping_carries_the_colour_across_the_break() {
+        let c = caps(true, true);
+        let painted = format!(
+            "начало {} конец",
+            paint(&c, Role::Accent, "очень длинный крашеный кусок")
+        );
+        let lines = wrap(&painted, 20);
+        assert!(lines.len() > 1, "не перенеслось: {lines:?}");
+        for l in &lines {
+            assert!(width(l) <= 20, "строка шире положенного: {l:?}");
+        }
+        // Внутри крашеного куска перенос обязан продолжить краску.
+        let inside = lines
+            .iter()
+            .find(|l| strip(l).trim() == "крашеный кусок конец")
+            .unwrap_or(&lines[1]);
+        assert!(
+            inside.starts_with('\x1b'),
+            "продолжение без краски: {inside:?}"
+        );
+        // Ни одна строка не оставляет краску открытой — иначе следующая
+        // строка кадра приедет чужим цветом.
+        for l in &lines {
+            assert!(
+                sgr_open("", l).is_empty(),
+                "краска осталась открытой: {l:?}"
+            );
+        }
+        // Текст без краски переносится ровно как раньше.
+        assert_eq!(wrap("раз два три", 7), vec!["раз два", "три"]);
     }
 }

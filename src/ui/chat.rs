@@ -8,7 +8,7 @@
 use crate::app::App;
 use crate::core::node::NodeClient;
 use crate::core::util::{clock, ellipsize, one_line};
-use crate::ui::style::{band, paint, truncate, width, wrap, Bg, Caps, Role};
+use crate::ui::style::{accent, band, paint, truncate, width, wrap, Bg, Caps, Role};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -147,14 +147,20 @@ fn tool_detail(input: Option<&Value>) -> String {
 pub enum Md {
     /// Обычный текст.
     Plain(String),
-    /// Заголовок — весом, а не решётками.
-    Head(String),
-    /// Пункт списка.
-    Item(String),
+    /// Заголовок — весом, а не решётками. Число — уровень: h1 крупнее h3.
+    Head(u8, String),
+    /// Пункт списка: уровень вложенности и текст.
+    Item(usize, String),
+    /// Начало ```-блока: язык, если он назван.
+    CodeStart(String),
     /// Строка кода внутри ```-блока.
     Code(String),
+    /// Конец ```-блока.
+    CodeEnd,
     /// Цитата.
     Quote(String),
+    /// Горизонтальная черта.
+    Rule,
 }
 
 /// Разобрать текст ответа в строки разметки.
@@ -167,7 +173,12 @@ pub fn markdown(text: &str) -> Vec<Md> {
     for raw in text.lines() {
         let line = raw.trim_end();
         let t = line.trim_start();
-        if t.starts_with("```") {
+        if let Some(rest) = t.strip_prefix("```") {
+            if in_code {
+                out.push(Md::CodeEnd);
+            } else {
+                out.push(Md::CodeStart(rest.trim().to_string()));
+            }
             in_code = !in_code;
             continue;
         }
@@ -175,25 +186,35 @@ pub fn markdown(text: &str) -> Vec<Md> {
             out.push(Md::Code(line.to_string()));
             continue;
         }
+        // Черта разделяет части ответа — она и на экране черта, а не три
+        // минуса посреди текста.
+        if matches!(t, "---" | "***" | "___" | "- - -") {
+            out.push(Md::Rule);
+            continue;
+        }
+        // Отступ пункта — это вложенность. Считаем по пробелам до значка:
+        // вложенный список без отступа читается как один плоский.
+        let indent = line.len() - line.trim_start().len();
         if let Some(rest) = t.strip_prefix("> ") {
-            out.push(Md::Quote(inline(rest)));
+            out.push(Md::Quote(rest.to_string()));
         } else if t.starts_with('#') {
+            let level = t.chars().take_while(|c| *c == '#').count().min(6) as u8;
             let title = t.trim_start_matches('#').trim();
             if title.is_empty() {
                 out.push(Md::Plain(String::new()));
             } else {
-                out.push(Md::Head(inline(title)));
+                out.push(Md::Head(level, title.to_string()));
             }
         } else if let Some(rest) = t
             .strip_prefix("- ")
             .or_else(|| t.strip_prefix("* "))
             .or_else(|| t.strip_prefix("+ "))
         {
-            out.push(Md::Item(inline(rest)));
+            out.push(Md::Item(indent / 2, rest.to_string()));
         } else if let Some((num, rest)) = numbered(t) {
-            out.push(Md::Item(format!("{num}. {}", inline(rest))));
+            out.push(Md::Item(indent / 2, format!("{num}. {rest}")));
         } else {
-            out.push(Md::Plain(inline(line)));
+            out.push(Md::Plain(line.to_string()));
         }
     }
     out
@@ -205,10 +226,139 @@ fn numbered(t: &str) -> Option<(u32, &str)> {
     head.parse::<u32>().ok().map(|n| (n, rest))
 }
 
-/// Строчная разметка: жирный и курсив в терминале рисовать нечем, зато
-/// звёздочки мешают читать. Обратные кавычки оставляем: код в строке видно.
-fn inline(s: &str) -> String {
-    crate::core::util::plain_text(s)
+/// Строчная разметка в краску: жирное — жирным, `код` — цветом, ссылка —
+/// подчёркиванием.
+///
+/// Раньше разметку просто снимали: звёздочки мешают читать, а «рисовать нечем»
+/// было неправдой — терминал умеет и вес, и курсив. Снятая разметка теряет
+/// ровно то, ради чего её ставили: агент выделяет имя файла или предупреждение,
+/// а человек видел ровный серый текст.
+///
+/// Открывающая звёздочка обязана прилегать к слову, закрывающая — тоже: иначе
+/// «2 * 2 * 3» превратилось бы в курсив.
+fn inline(caps: &Caps, s: &str, base: Role) -> String {
+    let ch: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut plain = String::new();
+    let mut i = 0usize;
+    while i < ch.len() {
+        let c = ch[i];
+        // `код` — цветом, содержимое не разбираем: там звёздочки принадлежат
+        // коду.
+        if c == '`' {
+            if let Some(j) = close_at(&ch, i + 1, '`', 1) {
+                flush(caps, base, &mut plain, &mut out);
+                out.push_str(&accent(
+                    caps,
+                    Role::Accent,
+                    &[],
+                    &ch[i + 1..j].iter().collect::<String>(),
+                ));
+                i = j + 1;
+                continue;
+            }
+        }
+        // ~~зачёркнутое~~
+        if c == '~' && ch.get(i + 1) == Some(&'~') {
+            if let Some(j) = close_at(&ch, i + 2, '~', 2) {
+                flush(caps, base, &mut plain, &mut out);
+                let body: String = ch[i + 2..j].iter().collect();
+                out.push_str(&accent(caps, base, &[9], &inline(caps, &body, base)));
+                i = j + 2;
+                continue;
+            }
+        }
+        // **жирное** и __жирное__
+        if (c == '*' || c == '_') && ch.get(i + 1) == Some(&c) && word_edge(&ch, i, c) {
+            if let Some(j) = close_at(&ch, i + 2, c, 2) {
+                flush(caps, base, &mut plain, &mut out);
+                let body: String = ch[i + 2..j].iter().collect();
+                out.push_str(&accent(caps, base, &[1], &body));
+                i = j + 2;
+                continue;
+            }
+        }
+        // *курсив* и _курсив_
+        if (c == '*' || c == '_')
+            && ch.get(i + 1).is_some_and(|n| !n.is_whitespace())
+            && word_edge(&ch, i, c)
+        {
+            if let Some(j) = close_at(&ch, i + 1, c, 1) {
+                if ch.get(j - 1).is_some_and(|p| !p.is_whitespace()) {
+                    flush(caps, base, &mut plain, &mut out);
+                    let body: String = ch[i + 1..j].iter().collect();
+                    out.push_str(&accent(caps, base, &[3], &body));
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        // [текст](ссылка): подчёркиваем текст, а саму ссылку показываем только
+        // если она говорит не то же самое.
+        if c == '[' {
+            if let Some((text, url, end)) = link_at(&ch, i) {
+                flush(caps, base, &mut plain, &mut out);
+                out.push_str(&accent(caps, Role::Accent, &[4], &text));
+                if text != url {
+                    out.push_str(&paint(caps, Role::Dim, &format!(" ({url})")));
+                }
+                i = end;
+                continue;
+            }
+        }
+        plain.push(c);
+        i += 1;
+    }
+    flush(caps, base, &mut plain, &mut out);
+    out
+}
+
+/// Сбросить накопленный обычный текст в вывод.
+fn flush(caps: &Caps, base: Role, plain: &mut String, out: &mut String) {
+    if !plain.is_empty() {
+        out.push_str(&paint(caps, base, plain));
+        plain.clear();
+    }
+}
+
+/// Можно ли начинать разметку в этом месте.
+///
+/// Подчёркивание внутри слова — часть имени, а не курсив: `snake_case_name` не
+/// должен рассыпаться на куски. Для звёздочки такого правила нет — она внутри
+/// слова разметкой и считается.
+fn word_edge(ch: &[char], at: usize, mark: char) -> bool {
+    if mark != '_' {
+        return true;
+    }
+    at == 0 || !ch[at - 1].is_alphanumeric()
+}
+
+/// Где закрывается разметка: `len` одинаковых знаков подряд, начиная с `from`.
+/// Пустая вставка (`**` подряд) разметкой не считается.
+fn close_at(ch: &[char], from: usize, mark: char, len: usize) -> Option<usize> {
+    let mut i = from;
+    while i + len <= ch.len() {
+        if ch[i..i + len].iter().all(|c| *c == mark) && i > from {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `[текст](ссылка)` начиная с `at`: (текст, ссылка, где кончилось).
+fn link_at(ch: &[char], at: usize) -> Option<(String, String, usize)> {
+    let close = ch.iter().skip(at + 1).position(|c| *c == ']')? + at + 1;
+    if ch.get(close + 1) != Some(&'(') {
+        return None;
+    }
+    let end = ch.iter().skip(close + 2).position(|c| *c == ')')? + close + 2;
+    let text: String = ch[at + 1..close].iter().collect();
+    let url: String = ch[close + 2..end].iter().collect();
+    if text.is_empty() || url.is_empty() {
+        return None;
+    }
+    Some((text, url, end + 1))
 }
 
 /// Разметку показываем как текст — для строк, где формат не важен.
@@ -247,38 +397,55 @@ pub fn block(caps: &Caps, it: &Item, total: usize) -> Vec<String> {
             let mut out = Vec::new();
             for md in markdown(&it.text) {
                 match md {
-                    Md::Head(t) => {
-                        for l in wrap(&t, room) {
-                            out.push(format!("  {}", crate::ui::style::bold(caps, &l)));
+                    // Заголовок — весом и краской; первый уровень ещё и
+                    // подчёркнут: в длинном ответе он делит текст на части.
+                    Md::Head(level, t) => {
+                        let attrs: &[u8] = if level <= 1 { &[1, 4] } else { &[1] };
+                        for l in wrap(&inline(caps, &t, Role::Text), room) {
+                            out.push(format!("  {}", accent(caps, Role::Plain, attrs, &l)));
                         }
                     }
-                    Md::Item(t) => {
-                        for (i, l) in wrap(&t, room.saturating_sub(2)).into_iter().enumerate() {
+                    Md::Item(level, t) => {
+                        // Вложенность отступом: плоский список из вложенного
+                        // читается как перечисление одного уровня, а это враньё.
+                        let pad = "  ".repeat(level.min(4));
+                        let head = room.saturating_sub(2 + width(&pad));
+                        for (i, l) in wrap(&inline(caps, &t, Role::Text), head)
+                            .into_iter()
+                            .enumerate()
+                        {
                             let mark = if i == 0 { "·" } else { " " };
-                            out.push(format!(
-                                "  {} {}",
-                                paint(caps, Role::Accent, mark),
-                                paint(caps, Role::Text, &l)
-                            ));
+                            out.push(format!("  {pad}{} {}", paint(caps, Role::Accent, mark), l));
                         }
                     }
+                    // Блок кода — с полосой слева и названием языка: так видно,
+                    // где он начался и где кончился, даже посреди длинного
+                    // ответа.
+                    Md::CodeStart(lang) if !lang.is_empty() => out.push(format!(
+                        "  {} {}",
+                        paint(caps, Role::Border, "┌"),
+                        paint(caps, Role::Dim, &lang)
+                    )),
+                    Md::CodeStart(_) => out.push(format!("  {}", paint(caps, Role::Border, "┌"))),
+                    Md::CodeEnd => out.push(format!("  {}", paint(caps, Role::Border, "└"))),
                     Md::Code(t) => out.push(format!(
-                        "  {}",
-                        paint(caps, Role::Muted, &truncate(&t, room))
+                        "  {} {}",
+                        paint(caps, Role::Border, "│"),
+                        paint(caps, Role::Muted, &truncate(&t, room.saturating_sub(2)))
                     )),
                     Md::Quote(t) => {
-                        for l in wrap(&t, room.saturating_sub(2)) {
-                            out.push(format!(
-                                "  {} {}",
-                                paint(caps, Role::Border, "│"),
-                                paint(caps, Role::Muted, &l)
-                            ));
+                        for l in wrap(&inline(caps, &t, Role::Muted), room.saturating_sub(2)) {
+                            out.push(format!("  {} {}", paint(caps, Role::Border, "│"), l));
                         }
                     }
+                    Md::Rule => out.push(format!(
+                        "  {}",
+                        paint(caps, Role::Border, &"─".repeat(room.min(60)))
+                    )),
                     Md::Plain(t) if t.trim().is_empty() => out.push(String::new()),
                     Md::Plain(t) => {
-                        for l in wrap(&t, room) {
-                            out.push(format!("  {}", paint(caps, Role::Text, &l)));
+                        for l in wrap(&inline(caps, &t, Role::Text), room) {
+                            out.push(format!("  {l}"));
                         }
                     }
                 }
@@ -538,8 +705,8 @@ mod tests {
         let md = markdown(
             "# Итог\n\nСделал:\n- первое\n- второе\n\n```\nfn main() {}\n```\n> и заметка",
         );
-        assert!(matches!(&md[0], Md::Head(t) if t == "Итог"));
-        assert!(matches!(&md[3], Md::Item(t) if t == "первое"));
+        assert!(matches!(&md[0], Md::Head(1, t) if t == "Итог"));
+        assert!(matches!(&md[3], Md::Item(0, t) if t == "первое"));
         assert!(md
             .iter()
             .any(|m| matches!(m, Md::Code(t) if t.contains("fn main"))));
@@ -555,30 +722,86 @@ mod tests {
     /// Внутри блока кода разметку не трогаем: звёздочка там — звёздочка.
     #[test]
     fn code_blocks_keep_their_asterisks() {
-        let md = markdown("```\nlet x = a * b * c;\n```");
-        assert!(matches!(&md[0], Md::Code(t) if t.contains("a * b * c")));
+        let md = markdown("```rust\nlet x = a * b * c;\n```");
+        assert!(matches!(&md[0], Md::CodeStart(l) if l == "rust"), "{md:?}");
+        assert!(
+            matches!(&md[1], Md::Code(t) if t.contains("a * b * c")),
+            "{md:?}"
+        );
+        assert!(matches!(&md[2], Md::CodeEnd));
     }
 
     /// Умножение не должно превращаться в курсив.
     #[test]
     fn multiplication_survives_the_italics_rule() {
-        let md = markdown("площадь = 2 * 2 * 3");
+        let c = colored_caps();
+        let plain = crate::ui::style::strip(&inline(&c, "площадь = 2 * 2 * 3", Role::Text));
+        assert_eq!(plain, "площадь = 2 * 2 * 3");
+        // А парные звёздочки вокруг слова становятся курсивом — и исчезают
+        // сами, оставив на экране только слово.
+        let it = inline(&c, "это *важно* сегодня", Role::Text);
+        assert_eq!(crate::ui::style::strip(&it), "это важно сегодня");
+        assert!(italic_on(&it), "курсив не включился: {it:?}");
+    }
+
+    /// Разметка обязана становиться начертанием, а не пропадать: агент
+    /// выделяет имя файла и предупреждение, и это надо видеть.
+    #[test]
+    fn inline_markup_becomes_weight_and_colour() {
+        let c = colored_caps();
+        let bold = inline(&c, "это **важно** очень", Role::Text);
+        assert_eq!(crate::ui::style::strip(&bold), "это важно очень");
         assert!(
-            matches!(&md[0], Md::Plain(t) if t.contains("2 * 2 * 3")),
-            "{md:?}"
+            bold.contains("\x1b[1;") || bold.contains("\x1b[1m"),
+            "жирный не включился: {bold:?}"
         );
-        // А парные звёздочки вокруг слова — убираем.
-        let md = markdown("это *важно* сегодня");
-        assert!(
-            matches!(&md[0], Md::Plain(t) if t == "это важно сегодня"),
-            "{md:?}"
+
+        let code = inline(&c, "правь `src/main.rs` сегодня", Role::Text);
+        assert_eq!(crate::ui::style::strip(&code), "правь src/main.rs сегодня");
+        // Внутри кода разметку не разбираем: звёздочка там — звёздочка.
+        let stars = inline(&c, "`a * b * c`", Role::Text);
+        assert_eq!(crate::ui::style::strip(&stars), "a * b * c");
+
+        // Ссылка: текст подчёркнут, адрес рядом — но только если он говорит не
+        // то же самое.
+        let link = inline(&c, "смотри [доки](https://pi.dev)", Role::Text);
+        assert!(crate::ui::style::strip(&link).contains("доки (https://pi.dev)"));
+        let same = inline(&c, "[https://pi.dev](https://pi.dev)", Role::Text);
+        assert_eq!(crate::ui::style::strip(&same), "https://pi.dev");
+
+        // Подчёркивание внутри имени — часть имени: `snake_case_name` не
+        // рассыпается на курсив.
+        let snake = inline(&c, "функция snake_case_name готова", Role::Text);
+        assert_eq!(
+            crate::ui::style::strip(&snake),
+            "функция snake_case_name готова"
         );
+        assert!(!italic_on(&snake), "{snake:?}");
+    }
+
+    /// Курсив — это ровно «3» отдельным кодом: «38;2;…» — это цвет, и
+    /// проверка на «\x1b[3» ловила бы его.
+    fn italic_on(s: &str) -> bool {
+        s.contains("\x1b[3;") || s.contains("\x1b[3m")
+    }
+
+    fn colored_caps() -> Caps {
+        Caps {
+            color: true,
+            theme: crate::ui::style::Theme::Dark,
+            truecolor: true,
+            unicode: true,
+            width: 80,
+        }
     }
 
     #[test]
     fn numbered_lists_keep_their_numbers() {
         let md = markdown("1. первое\n2. второе");
-        assert!(matches!(&md[0], Md::Item(t) if t == "1. первое"), "{md:?}");
+        assert!(
+            matches!(&md[0], Md::Item(0, t) if t == "1. первое"),
+            "{md:?}"
+        );
     }
 
     /// Реплика человека и ответ агента должны различаться на глаз мгновенно:
