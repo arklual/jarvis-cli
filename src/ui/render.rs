@@ -304,6 +304,7 @@ mod tests {
     fn limit_row_names_the_window_once() {
         let c = Caps {
             color: false,
+            theme: crate::ui::style::Theme::Dark,
             truecolor: false,
             unicode: true,
             width: 80,
@@ -322,6 +323,7 @@ mod tests {
     fn caps() -> Caps {
         Caps {
             color: false,
+            theme: crate::ui::style::Theme::Dark,
             truecolor: false,
             unicode: true,
             width: 80,

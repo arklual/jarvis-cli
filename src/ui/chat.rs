@@ -476,6 +476,7 @@ mod tests {
     fn caps() -> Caps {
         Caps {
             color: false,
+            theme: crate::ui::style::Theme::Dark,
             truecolor: false,
             unicode: true,
             width: 80,
@@ -599,6 +600,7 @@ mod tests {
     fn user_block_is_a_band_and_agent_block_is_not() {
         let c = Caps {
             color: true,
+            theme: crate::ui::style::Theme::Dark,
             truecolor: true,
             unicode: true,
             width: 40,
@@ -631,6 +633,7 @@ mod tests {
     fn long_text_wraps_instead_of_being_cut() {
         let c = Caps {
             color: false,
+            theme: crate::ui::style::Theme::Dark,
             truecolor: false,
             unicode: true,
             width: 40,

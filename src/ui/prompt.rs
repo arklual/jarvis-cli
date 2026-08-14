@@ -250,6 +250,7 @@ mod tests {
     fn caps() -> Caps {
         Caps {
             color: false,
+            theme: crate::ui::style::Theme::Dark,
             truecolor: false,
             unicode: true,
             width: 80,

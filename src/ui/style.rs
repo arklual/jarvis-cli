@@ -21,6 +21,8 @@ use std::io::IsTerminal;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Caps {
     pub color: bool,
+    /// Тёмный терминал или светлый — от этого зависит вся палитра.
+    pub theme: Theme,
     /// Терминал умеет 24 бита. Иначе цвет приближается кубом из 256.
     pub truecolor: bool,
     pub unicode: bool,
@@ -31,6 +33,7 @@ impl Default for Caps {
     fn default() -> Self {
         Self {
             color: false,
+            theme: Theme::Dark,
             truecolor: false,
             unicode: false,
             width: 80,
@@ -58,6 +61,7 @@ impl Caps {
             .to_lowercase();
         Self {
             color,
+            theme: Theme::detect(),
             truecolor: color && (ct.contains("truecolor") || ct.contains("24bit")),
             unicode: lang.contains("UTF"),
             width: term_width(),
@@ -85,6 +89,45 @@ fn term_width() -> u16 {
 /// Палитра. Значения — из темы pi: они уже подобраны так, чтобы не резать
 /// глаз ни на светлом, ни на тёмном фоне, и чтобы соседние роли различались
 /// при беглом взгляде, а не при сравнении.
+/// Какая тема сейчас. Светлый терминал — не редкость, а на нём тёмная палитра
+/// выглядит выцветшей: серое по белому почти не читается.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Theme {
+    /// Определить по терминалу и настройке.
+    ///
+    /// `JARVIS_THEME=light|dark` — прямое слово человека, оно сильнее всего.
+    /// Иначе смотрим `COLORFGBG` (его ставят xterm, konsole, iTerm): в нём
+    /// фон — последнее число, и светлым считается всё, что ярче середины.
+    pub fn detect() -> Theme {
+        match std::env::var("JARVIS_THEME").unwrap_or_default().trim() {
+            "light" | "светлая" => return Theme::Light,
+            "dark" | "тёмная" | "темная" => return Theme::Dark,
+            _ => {}
+        }
+        let Ok(fgbg) = std::env::var("COLORFGBG") else {
+            // Не сказали — считаем тёмным: так выглядит большинство терминалов,
+            // и ошибка в эту сторону дешевле (тёмное на светлом читается
+            // хуже, чем светлое на тёмном).
+            return Theme::Dark;
+        };
+        match fgbg
+            .rsplit(';')
+            .next()
+            .and_then(|b| b.trim().parse::<u8>().ok())
+        {
+            // 0–6 и 8 — тёмные цвета палитры, 7 и 15 — светлые.
+            Some(bg) if bg == 7 || bg >= 9 => Theme::Light,
+            _ => Theme::Dark,
+        }
+    }
+}
+
 mod ink {
     pub const TEXT: (u8, u8, u8) = (0xd4, 0xd4, 0xd4);
     pub const MUTED: (u8, u8, u8) = (0x8a, 0x8a, 0x8a);
@@ -101,6 +144,26 @@ mod ink {
     pub const BG_USER: (u8, u8, u8) = (0x34, 0x35, 0x41);
     pub const BG_TOOL: (u8, u8, u8) = (0x28, 0x28, 0x32);
     pub const BG_ERR: (u8, u8, u8) = (0x3c, 0x28, 0x28);
+
+    /// Светлая палитра — значения из темы pi (light.json): на белом фоне
+    /// нужны не «те же цвета потемнее», а свои, иначе жёлтый становится
+    /// невидимым, а серый — грязным.
+    pub mod light {
+        pub const TEXT: (u8, u8, u8) = (0x1f, 0x23, 0x28);
+        pub const MUTED: (u8, u8, u8) = (0x6c, 0x6c, 0x6c);
+        pub const DIM: (u8, u8, u8) = (0x76, 0x76, 0x76);
+        pub const ACCENT: (u8, u8, u8) = (0x5a, 0x80, 0x80);
+        pub const OK: (u8, u8, u8) = (0x58, 0x84, 0x58);
+        pub const WARN: (u8, u8, u8) = (0x9a, 0x73, 0x26);
+        pub const ERR: (u8, u8, u8) = (0xaa, 0x55, 0x55);
+        pub const BORDER: (u8, u8, u8) = (0xb0, 0xb0, 0xb0);
+
+        pub const BG_HEAD: (u8, u8, u8) = (0xe4, 0xe4, 0xea);
+        pub const BG_SEL: (u8, u8, u8) = (0xd0, 0xd0, 0xe0);
+        pub const BG_USER: (u8, u8, u8) = (0xe8, 0xe8, 0xe8);
+        pub const BG_TOOL: (u8, u8, u8) = (0xe8, 0xe8, 0xf0);
+        pub const BG_ERR: (u8, u8, u8) = (0xf0, 0xe8, 0xe8);
+    }
 }
 
 /// Роль текста — назначается по смыслу строки, а не по настроению.
@@ -137,7 +200,20 @@ pub enum Bg {
     Bad,
 }
 
-fn rgb(role: Role) -> Option<(u8, u8, u8)> {
+fn rgb(theme: Theme, role: Role) -> Option<(u8, u8, u8)> {
+    if theme == Theme::Light {
+        return Some(match role {
+            Role::Plain => return None,
+            Role::Text => ink::light::TEXT,
+            Role::Muted => ink::light::MUTED,
+            Role::Dim => ink::light::DIM,
+            Role::Accent => ink::light::ACCENT,
+            Role::Ok => ink::light::OK,
+            Role::Warn => ink::light::WARN,
+            Role::Bad => ink::light::ERR,
+            Role::Border => ink::light::BORDER,
+        });
+    }
     Some(match role {
         Role::Plain => return None,
         Role::Text => ink::TEXT,
@@ -151,7 +227,16 @@ fn rgb(role: Role) -> Option<(u8, u8, u8)> {
     })
 }
 
-fn bg_rgb(bg: Bg) -> (u8, u8, u8) {
+fn bg_rgb(theme: Theme, bg: Bg) -> (u8, u8, u8) {
+    if theme == Theme::Light {
+        return match bg {
+            Bg::Head => ink::light::BG_HEAD,
+            Bg::Sel => ink::light::BG_SEL,
+            Bg::User => ink::light::BG_USER,
+            Bg::Tool => ink::light::BG_TOOL,
+            Bg::Bad => ink::light::BG_ERR,
+        };
+    }
     match bg {
         Bg::Head => ink::BG_HEAD,
         Bg::Sel => ink::BG_SEL,
@@ -211,7 +296,7 @@ pub fn paint(caps: &Caps, role: Role, text: &str) -> String {
     }
     match role {
         Role::Plain => text.to_string(),
-        r => match rgb(r) {
+        r => match rgb(caps.theme, r) {
             None => text.to_string(),
             Some(c) => format!("\x1b[{}m{text}\x1b[0m", sgr(caps, c, false)),
         },
@@ -248,7 +333,7 @@ pub fn on_bg(caps: &Caps, bg: Bg, body: &str) -> String {
     if !caps.color {
         return body.to_string();
     }
-    let code = sgr(caps, bg_rgb(bg), true);
+    let code = sgr(caps, bg_rgb(caps.theme, bg), true);
     let inner = body.replace("\x1b[0m", &format!("\x1b[0m\x1b[{code}m"));
     format!("\x1b[{code}m{inner}\x1b[0m")
 }
@@ -664,6 +749,7 @@ mod tests {
     fn the_spinner_turns_without_changing_width() {
         let c = Caps {
             color: false,
+            theme: Theme::Dark,
             truecolor: false,
             unicode: true,
             width: 40,
@@ -694,6 +780,7 @@ mod tests {
     fn colored() -> Caps {
         Caps {
             color: true,
+            theme: Theme::Dark,
             truecolor: true,
             unicode: true,
             width: 40,
@@ -721,6 +808,7 @@ mod tests {
     fn band_without_color_is_just_padded_text() {
         let c = Caps {
             color: false,
+            theme: Theme::Dark,
             truecolor: false,
             unicode: true,
             width: 40,
@@ -832,6 +920,7 @@ mod tests {
         assert!(term_width() >= 20);
         let narrow = Caps {
             color: false,
+            theme: Theme::Dark,
             truecolor: false,
             unicode: true,
             width: term_width(),
@@ -842,6 +931,7 @@ mod tests {
     fn caps(color: bool, unicode: bool) -> Caps {
         Caps {
             color,
+            theme: Theme::Dark,
             truecolor: color,
             unicode,
             width: 80,
@@ -853,6 +943,55 @@ mod tests {
         let c = caps(false, true);
         assert_eq!(paint(&c, Role::Accent, "готово"), "готово");
         assert!(!dot(&c, "waiting").contains('\x1b'));
+    }
+
+    /// На светлом терминале тёмная палитра выцветает: серое по белому почти
+    /// не читается. Тема определяется до первой отрисовки.
+    #[test]
+    fn the_theme_is_read_from_the_terminal_and_the_word_of_the_human() {
+        // Прямое слово человека сильнее всего.
+        std::env::set_var("JARVIS_THEME", "light");
+        assert_eq!(Theme::detect(), Theme::Light);
+        std::env::set_var("JARVIS_THEME", "тёмная");
+        assert_eq!(Theme::detect(), Theme::Dark);
+        std::env::remove_var("JARVIS_THEME");
+        // Иначе — по фону терминала: 15 и 7 светлые, 0 тёмный.
+        std::env::set_var("COLORFGBG", "0;15");
+        assert_eq!(Theme::detect(), Theme::Light);
+        std::env::set_var("COLORFGBG", "15;0");
+        assert_eq!(Theme::detect(), Theme::Dark);
+        std::env::remove_var("COLORFGBG");
+        // Молчание — тёмная: ошибка в эту сторону дешевле.
+        assert_eq!(Theme::detect(), Theme::Dark);
+    }
+
+    /// Светлая тема — не «те же цвета потемнее»: на белом жёлтый становится
+    /// невидимым, а серый грязным, поэтому значения свои.
+    #[test]
+    fn light_and_dark_are_different_palettes() {
+        let dark = Caps {
+            color: true,
+            theme: Theme::Dark,
+            truecolor: true,
+            unicode: true,
+            width: 40,
+        };
+        let light = Caps {
+            theme: Theme::Light,
+            ..dark
+        };
+        for role in [Role::Text, Role::Muted, Role::Accent, Role::Warn, Role::Bad] {
+            assert_ne!(
+                paint(&dark, role, "х"),
+                paint(&light, role, "х"),
+                "роль {role:?} одинакова в обеих темах"
+            );
+        }
+        // Подложки тоже: тёмная полоса на белом листе — дыра.
+        assert_ne!(
+            band(&dark, Bg::Sel, "х", 10),
+            band(&light, Bg::Sel, "х", 10)
+        );
     }
 
     /// Кластеры: буква с диакритикой, эмодзи с селектором и семья через
