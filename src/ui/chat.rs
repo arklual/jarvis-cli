@@ -500,6 +500,24 @@ pub fn feed_lines(caps: &Caps, items: &[Item], total: usize) -> Vec<String> {
     out
 }
 
+/// На сколько строк вырастет лента от новых записей.
+///
+/// Нужно ровно для одного: человек читает историю, а лента растёт снизу. Окно
+/// видимого считается от конца, поэтому без поправки каждая новая строка
+/// уносила бы прочитанное вверх — это и есть «прокрутка сама прыгает».
+pub fn grown_lines(caps: &Caps, prev: Option<&Kind>, items: &[Item], total: usize) -> usize {
+    let mut n = 0;
+    let mut prev = prev.cloned();
+    for it in items {
+        if needs_gap(prev.as_ref(), &it.kind) {
+            n += 1;
+        }
+        n += block(caps, it, total).len();
+        prev = Some(it.kind.clone());
+    }
+    n
+}
+
 /// Показать чат и дочитывать, пока не прервут.
 /// Лента одного транскрипта, читаемая по кусочку.
 ///
@@ -891,5 +909,52 @@ mod tests {
         let line = project_line(&c, "/home/bob/projects/jarvis", 12, 0);
         assert!(line.contains("jarvis") && !line.contains("/home/bob"));
         assert!(line.contains("12 чат."));
+    }
+    /// Поправка прокрутки считается ровно по тем строкам, которые лента и
+    /// нарисует: иначе окно уедет на пару строк и человек потеряет место.
+    #[test]
+    fn growth_is_counted_in_the_very_lines_the_feed_draws() {
+        let c = colored_caps();
+        let items = vec![
+            Item {
+                kind: Kind::Agent,
+                text: "первая строка\nвторая строка".into(),
+                detail: String::new(),
+            },
+            Item {
+                kind: Kind::Tool,
+                text: "Bash".into(),
+                detail: "ls".into(),
+            },
+        ];
+        let grew = grown_lines(&c, Some(&Kind::User), &items, 60);
+        // Ровно столько же строк, сколько появится в самой ленте.
+        let before = feed_lines(&c, &[], 60).len();
+        let after = feed_lines(
+            &c,
+            &[
+                Item {
+                    kind: Kind::User,
+                    text: "было".into(),
+                    detail: String::new(),
+                },
+                items[0].clone(),
+                items[1].clone(),
+            ],
+            60,
+        )
+        .len();
+        let user_only = feed_lines(
+            &c,
+            &[Item {
+                kind: Kind::User,
+                text: "было".into(),
+                detail: String::new(),
+            }],
+            60,
+        )
+        .len();
+        assert_eq!(before, 0);
+        assert_eq!(grew, after - user_only, "поправка разошлась с лентой");
     }
 }

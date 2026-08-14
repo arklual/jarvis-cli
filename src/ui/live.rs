@@ -506,7 +506,7 @@ pub async fn run(app: &App, machine_name: &str) -> Result<(), String> {
         }
 
         // 3. То, что подгружается по виду.
-        refresh(&mut ui, &client).await;
+        refresh(&mut ui, &client, &caps).await;
     }
 }
 
@@ -1815,13 +1815,25 @@ async fn run_slash(
 }
 
 /// Подтянуть то, что нужно текущему виду, и не чаще, чем нужно.
-async fn refresh(ui: &mut Ui, client: &NodeClient) {
+async fn refresh(ui: &mut Ui, client: &NodeClient, caps: &Caps) {
     let now = now_ms();
     if ui.view == View::Chat && now - ui.feed_at > FEED_EVERY {
         ui.feed_at = now;
         if let Some(feed) = ui.feed.as_mut() {
             match feed.poll(client).await {
                 Ok(items) if !items.is_empty() => {
+                    // Пока человек листает историю, лента растёт снизу. Окно
+                    // видимого считается от конца, поэтому прокрутку надо
+                    // подвинуть ровно на столько строк, сколько прибавилось, —
+                    // иначе прочитанное уезжает вверх само собой.
+                    if ui.scroll > 0 {
+                        ui.scroll += chat::grown_lines(
+                            caps,
+                            ui.items.last().map(|i| &i.kind),
+                            &items,
+                            caps.width as usize,
+                        );
+                    }
                     ui.items.extend(items);
                     let extra = ui.items.len().saturating_sub(MAX_ITEMS);
                     if extra > 0 {
