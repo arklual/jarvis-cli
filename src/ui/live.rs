@@ -547,6 +547,89 @@ fn idle_typing(ui: &Ui) -> Typing {
     }
 }
 
+/// Подходящие значения аргумента для показа под строкой ввода.
+fn arg_palette(ui: &Ui, list: &[Session]) -> Vec<String> {
+    let line = ui.input.text();
+    if !line.starts_with('/') || line.starts_with("//") {
+        return Vec::new();
+    }
+    let head = line.split_whitespace().next().unwrap_or("/");
+    if !line[head.len()..].starts_with(' ') {
+        return Vec::new();
+    }
+    let name = head.trim_start_matches('/').to_lowercase();
+    let part = line[head.len()..].trim_start();
+    let cands = arg_candidates(ui, list, &name, part);
+    slash::rank(part, &cands)
+}
+
+/// Что подставлять вторым словом команды: живые сессии, каталоги, слова.
+///
+/// Кандидаты берём из того, что человек видит прямо сейчас: список сессий
+/// перед ним, каталоги — под ним. Придуманные подсказки хуже отсутствующих.
+fn arg_candidates(ui: &Ui, list: &[Session], name: &str, part: &str) -> Vec<String> {
+    match slash::arg_of(name) {
+        slash::Arg::Session => {
+            let mut out: Vec<String> = list.iter().map(|s| s.title()).collect();
+            out.sort();
+            out.dedup();
+            out
+        }
+        slash::Arg::Word(words) => words.iter().map(|w| w.to_string()).collect(),
+        slash::Arg::Dir => dir_candidates(part),
+        _ => {
+            let _ = ui;
+            Vec::new()
+        }
+    }
+}
+
+/// Каталоги по началу пути. Только каталоги: `/run` запускает агента в
+/// каталоге, и подсовывать файлы значило бы предлагать заведомо неверное.
+fn dir_candidates(part: &str) -> Vec<String> {
+    let raw = crate::core::util::expand_tilde(part);
+    let (dir, prefix) = if part.ends_with('/') {
+        (raw.clone(), String::new())
+    } else {
+        (
+            raw.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
+            raw.file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        )
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        std::path::PathBuf::from(".")
+    } else {
+        dir
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            // Скрытые каталоги показываем, только когда их спросили точкой:
+            // иначе список — это .git, .cache и прочее, чего никто не искал.
+            if name.starts_with('.') && !prefix.starts_with('.') {
+                return None;
+            }
+            if !prefix.is_empty() && !name.to_lowercase().starts_with(&prefix.to_lowercase()) {
+                return None;
+            }
+            Some(format!(
+                "{}/{name}",
+                dir.to_string_lossy().trim_end_matches('/')
+            ))
+        })
+        .collect();
+    out.sort();
+    out.truncate(30);
+    out
+}
+
 /// Палитра показывается, пока строка похожа на команду.
 fn palette(ui: &Ui) -> Vec<&'static slash::Command> {
     let line = ui.input.text();
@@ -1032,12 +1115,26 @@ async fn handle(
         Act::Tab => {
             // Дополняем только команду: в тексте сообщения Tab — это Tab.
             let line = ui.input.text().to_string();
-            if line.starts_with('/') {
-                let head = line.split_whitespace().next().unwrap_or("/").to_string();
+            if !line.starts_with('/') {
+                return true;
+            }
+            let head = line.split_whitespace().next().unwrap_or("/").to_string();
+            let rest = line[head.len()..].to_string();
+            if rest.trim().is_empty() && !line.ends_with(' ') {
+                // Дополняем имя команды.
                 if let Some(full) = slash::complete(&head) {
-                    let rest = line[head.len()..].to_string();
                     ui.input.set(format!("{full}{}", rest.trim_start()));
                 }
+                return true;
+            }
+            // Дальше — аргумент: подставляем из того, что человек видит.
+            let name = head.trim_start_matches('/').to_lowercase();
+            let part = rest.trim_start().to_string();
+            let cands = arg_candidates(ui, list, &name, &part);
+            if let Some(done) = slash::complete_arg(&part, &cands) {
+                ui.input.set(format!("{head} {done}"));
+            } else if cands.is_empty() {
+                ui.status = "дополнять нечем".into();
             }
         }
         Act::Slash => {
@@ -1593,7 +1690,18 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
         push(&mut out, "");
     }
     // Палитра команд — над строкой ввода, как только строка похожа на команду.
-    let hits = palette(ui);
+    // Аргумент набирают — показываем подходящие значения, а не список команд:
+    // «какие вообще бывают» человек спрашивает один раз, а «что подставить
+    // сюда» — каждый раз.
+    let arg_hits = arg_palette(ui, list);
+    for c in arg_hits.iter().take(6) {
+        push(&mut out, &format!("  {}", paint(caps, Role::Muted, c)));
+    }
+    let hits = if arg_hits.is_empty() {
+        palette(ui)
+    } else {
+        Vec::new()
+    };
     let col = hits
         .iter()
         .map(|c| {
@@ -2443,6 +2551,60 @@ mod tests {
             ui.status.contains("/compact"),
             "команду не адресовали агенту: {}",
             ui.status
+        );
+    }
+
+    /// Аргумент дополняется из того, что человек видит: живые сессии, а не
+    /// придуманные имена.
+    #[tokio::test]
+    async fn tab_completes_an_argument_from_live_sessions() {
+        let mut ui = ui_in(View::List, Typing::Command);
+        ui.input.set("/chat ja");
+        let sessions = vec![
+            Session {
+                id: "s1".into(),
+                project: Some("jarvis".into()),
+                ..Default::default()
+            },
+            Session {
+                id: "s2".into(),
+                project: Some("lct".into()),
+                ..Default::default()
+            },
+        ];
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let client = NodeClient::unix("/nonexistent.sock");
+        handle(&mut ui, Act::Tab, &client, &sessions, &Caps::default(), &tx).await;
+        assert_eq!(ui.input.text(), "/chat jarvis");
+    }
+
+    /// Слова аргумента у команд с готовым набором.
+    #[tokio::test]
+    async fn tab_completes_a_word_argument() {
+        let mut ui = ui_in(View::Chat, Typing::Command);
+        ui.input.set("/model op");
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let client = NodeClient::unix("/nonexistent.sock");
+        handle(&mut ui, Act::Tab, &client, &[], &Caps::default(), &tx).await;
+        assert_eq!(ui.input.text(), "/model opus");
+    }
+
+    /// Пока набирают аргумент, палитра показывает значения, а не список команд:
+    /// «какие бывают» спрашивают один раз, «что подставить сюда» — каждый раз.
+    #[test]
+    fn the_palette_switches_to_argument_values() {
+        let mut ui = ui_in(View::List, Typing::Command);
+        let sessions = vec![Session {
+            id: "s1".into(),
+            project: Some("jarvis".into()),
+            ..Default::default()
+        }];
+        ui.input.set("/chat ");
+        assert_eq!(arg_palette(&ui, &sessions), vec!["jarvis".to_string()]);
+        ui.input.set("/chat");
+        assert!(
+            arg_palette(&ui, &sessions).is_empty(),
+            "имя команды — ещё не аргумент"
         );
     }
 

@@ -72,13 +72,130 @@ pub fn parse(input: &str) -> Line {
     Line::Cmd { name, rest }
 }
 
-/// Команды, подходящие под начало имени: для палитры и дополнения.
+/// Насколько запрос похож на слово. Меньше — лучше; `None` — не подходит.
+///
+/// Правила те же, что у pi: буквы запроса должны идти по порядку, но не
+/// обязательно подряд. Подряд идущие — награда, разрывы — штраф, попадание в
+/// начало слова — большая награда. Так `/nb` находит «new bundle», а человеку
+/// не надо помнить, с какой буквы команда начинается.
+pub fn fuzzy_score(query: &str, text: &str) -> Option<f32> {
+    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
+    let t: Vec<char> = text.to_lowercase().chars().collect();
+    if q.is_empty() {
+        return Some(0.0);
+    }
+    if q.len() > t.len() {
+        return None;
+    }
+    let mut qi = 0usize;
+    let mut score = 0.0f32;
+    let mut last: i32 = -1;
+    let mut run = 0.0f32;
+    for (i, ch) in t.iter().enumerate() {
+        if qi >= q.len() {
+            break;
+        }
+        if *ch != q[qi] {
+            continue;
+        }
+        let boundary = i == 0 || matches!(t[i - 1], ' ' | '-' | '_' | '.' | '/' | ':');
+        if last == i as i32 - 1 {
+            run += 1.0;
+            score -= run * 5.0;
+        } else {
+            run = 0.0;
+            if last >= 0 {
+                score += (i as f32 - last as f32 - 1.0) * 2.0;
+            }
+        }
+        if boundary {
+            score -= 10.0;
+        }
+        score += i as f32 * 0.1;
+        last = i as i32;
+        qi += 1;
+    }
+    if qi < q.len() {
+        return None;
+    }
+    if q.len() == t.len() {
+        score -= 100.0;
+    }
+    Some(score)
+}
+
+/// Команды, подходящие под введённое: сначала по началу имени, потом по
+/// похожести.
+///
+/// Начало имени идёт первым не из вежливости: человек, набравший `/li`, ждёт
+/// `limits` и `list` — и увидеть их ниже «похожих» было бы издевательством.
 pub fn matching(prefix: &str) -> Vec<&'static Command> {
     let p = prefix.trim_start_matches('/').to_lowercase();
-    all()
+    let mut exact: Vec<&'static Command> = Vec::new();
+    let mut fuzzy: Vec<(f32, &'static Command)> = Vec::new();
+    for c in all() {
+        if c.name.starts_with(&p) {
+            exact.push(c);
+        } else if let Some(score) = fuzzy_score(&p, c.name) {
+            fuzzy.push((score, c));
+        }
+    }
+    fuzzy.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    exact.extend(fuzzy.into_iter().map(|(_, c)| c));
+    exact
+}
+
+/// Что команда ждёт вторым словом — по этому окно и подбирает подсказки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arg {
+    /// Ничего.
+    None,
+    /// Имя сессии: подставляем из живого списка.
+    Session,
+    /// Каталог на этой машине.
+    Dir,
+    /// Слово из готового набора (например «цикл» или «связка»).
+    Word(&'static [&'static str]),
+    /// Свободный текст — дополнять нечем.
+    Free,
+}
+
+pub fn arg_of(name: &str) -> Arg {
+    match name {
+        "chat" => Arg::Session,
+        "run" => Arg::Dir,
+        "new" => Arg::Word(&["связка", "цикл"]),
+        "model" => Arg::Word(&["opus", "fable", "sonnet", "haiku"]),
+        "effort" => Arg::Word(&["low", "medium", "high", "max"]),
+        "hand" => Arg::Free,
+        _ => Arg::None,
+    }
+}
+
+/// Дополнить аргумент по набранному куску: общее начало подходящих.
+pub fn complete_arg(part: &str, candidates: &[String]) -> Option<String> {
+    let hits = rank(part, candidates);
+    let first = hits.first()?;
+    let mut common = first.clone();
+    for h in &hits[1..] {
+        while !h.starts_with(&common) {
+            common.pop();
+            if common.is_empty() {
+                return None;
+            }
+        }
+    }
+    Some(common)
+}
+
+/// Отсортировать кандидатов по похожести на набранное.
+pub fn rank(part: &str, candidates: &[String]) -> Vec<String> {
+    let mut scored: Vec<(f32, &String)> = candidates
         .iter()
-        .filter(|c| c.name.starts_with(&p))
-        .collect::<Vec<_>>()
+        .filter_map(|c| fuzzy_score(part, c).map(|s| (s, c)))
+        .collect();
+    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().map(|(_, c)| c.clone()).collect()
 }
 
 /// Дополнение по Tab: общее начало всех подходящих.
@@ -87,7 +204,23 @@ pub fn matching(prefix: &str) -> Vec<&'static Command> {
 /// и `model`, и `merge`, и подставлять одну из них молча значит запускать не
 /// то, что человек имел в виду.
 pub fn complete(prefix: &str) -> Option<String> {
-    let hits = matching(prefix);
+    let p = prefix.trim_start_matches('/').to_lowercase();
+    // Дополняем по НАЧАЛУ имени: похожесть хороша для показа списка, но
+    // подставлять по ней — значит угадывать за человека. Общее начало
+    // подходящих — ровно то, в чём сомнений нет.
+    let starts: Vec<&'static Command> = all().iter().filter(|c| c.name.starts_with(&p)).collect();
+    let hits = if starts.is_empty() {
+        // Ничего не начинается так — но если похожая ровно одна, выбора всё
+        // равно нет, и подставить её честно.
+        let fuzzy = matching(prefix);
+        if fuzzy.len() == 1 {
+            fuzzy
+        } else {
+            return None;
+        }
+    } else {
+        starts
+    };
     let first = hits.first()?;
     let mut common = first.name.to_string();
     for h in &hits[1..] {
@@ -150,6 +283,66 @@ mod tests {
         assert_eq!(matching("/quit").len(), 1);
         assert!(matching("/нетакой").is_empty());
         assert_eq!(matching("/").len(), all().len(), "пустой префикс — все");
+    }
+
+    /// Похожесть — чтобы не помнить, с какой буквы начинается команда.
+    #[test]
+    fn fuzzy_finds_by_letters_in_order() {
+        assert!(
+            fuzzy_score("nb", "new bundle").is_some(),
+            "«nb» обязано находить «new bundle»"
+        );
+        assert!(
+            fuzzy_score("chat", "chat").unwrap() < fuzzy_score("cht", "chat").unwrap(),
+            "точное совпадение обязано быть лучше приблизительного"
+        );
+        assert!(
+            fuzzy_score("xyz", "chat").is_none(),
+            "чужие буквы не подходят"
+        );
+        assert!(
+            fuzzy_score("", "chat").is_some(),
+            "пустой запрос подходит всему"
+        );
+        // Порядок важен: «tahc» — не «chat».
+        assert!(fuzzy_score("tahc", "chat").is_none());
+    }
+
+    /// Набравший `/li` ждёт limits и list первыми: видеть их под «похожими»
+    /// было бы издевательством.
+    #[test]
+    fn prefix_matches_come_before_fuzzy_ones() {
+        let names: Vec<&str> = matching("/li").iter().map(|c| c.name).collect();
+        assert!(names[0].starts_with("li"), "{names:?}");
+        assert!(
+            names.iter().take(2).all(|n| n.starts_with("li")),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn arguments_are_known_per_command() {
+        assert_eq!(arg_of("chat"), Arg::Session);
+        assert_eq!(arg_of("run"), Arg::Dir);
+        assert_eq!(arg_of("limits"), Arg::None);
+        assert!(matches!(arg_of("model"), Arg::Word(_)));
+    }
+
+    #[test]
+    fn argument_completion_stops_at_the_common_start() {
+        let cands = vec![
+            "jarvis".to_string(),
+            "jarvis-cli".to_string(),
+            "lct".to_string(),
+        ];
+        assert_eq!(complete_arg("ja", &cands).as_deref(), Some("jarvis"));
+        assert_eq!(complete_arg("lc", &cands).as_deref(), Some("lct"));
+        assert_eq!(complete_arg("zzz", &cands), None);
+        // Ранжирование отдаёт подходящее первым, а не в порядке списка.
+        assert_eq!(
+            rank("cli", &cands).first().map(String::as_str),
+            Some("jarvis-cli")
+        );
     }
 
     /// Дополнение не должно угадывать за человека: `/m` — это и model, и merge.
