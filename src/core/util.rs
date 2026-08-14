@@ -34,6 +34,19 @@ pub fn expand_tilde(p: &str) -> PathBuf {
     }
 }
 
+/// Путь для человека: домашний каталог — тильдой.
+///
+/// Полный путь в сообщении об ошибке съедает всю строку и переносится посреди
+/// слова; «~/jarvis-node/node.sock» читается с одного взгляда.
+pub fn short_path(p: &str) -> String {
+    let home = home_dir();
+    let home = home.to_string_lossy();
+    match p.strip_prefix(home.as_ref()) {
+        Some(rest) if home != "/" => format!("~{rest}"),
+        _ => p.to_string(),
+    }
+}
+
 pub fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
 }

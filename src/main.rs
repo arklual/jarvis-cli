@@ -60,7 +60,22 @@ fn restore_sigpipe() {
 
 /// Ошибку — в stderr: stdout принадлежит данным, и пайп не должен получать
 /// жалобы вперемешку с выводом.
+///
+/// Переносим по ширине окна и с отступом: длинный путь внутри сообщения иначе
+/// рвётся посреди слова, и прочитать его нельзя. Строки после первой — это
+/// советы «что делать», их приглушаем: сперва читают, ЧТО сломалось.
 fn fail(msg: &str) {
     let caps = Caps::detect();
-    eprintln!("{} {msg}", paint(&caps, Role::Bad, "×"));
+    let room = (caps.width as usize).saturating_sub(4).max(20);
+    let mut first = true;
+    for para in msg.lines() {
+        for line in ui::style::wrap(para, room) {
+            if first {
+                eprintln!("{} {line}", paint(&caps, Role::Bad, "×"));
+                first = false;
+            } else {
+                eprintln!("  {}", paint(&caps, Role::Dim, &line));
+            }
+        }
+    }
 }

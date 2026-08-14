@@ -358,9 +358,14 @@ pub async fn connect(m: &Machine) -> Result<(NodeClient, Option<Tunnel>), String
                         .join(" · ")
                 ));
             }
+            // Три строки вместо одной: что сломалось, где искать и что
+            // сделать. Одной строкой это превращалось в простыню, из которой
+            // человеку всё равно приходилось догадываться.
             return Err(format!(
-                "узла нет на {sock} — проверь, запущен ли jarvis-node, \
-                 и верен ли JARVIS_DIR"
+                "узла нет\nсокет: {}\nзапусти панель Jarvis — узел поднимается вместе с ней\n\
+                 или укажи чужой каталог: JARVIS_DIR=… jarvis ls\n\
+                 а если агенты на другой машине: jarvis machines add <имя> <ssh>",
+                crate::core::util::short_path(&sock)
             ));
         }
         return Ok((NodeClient::unix(sock), None));

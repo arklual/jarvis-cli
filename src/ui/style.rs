@@ -382,36 +382,29 @@ pub fn wrap(text: &str, max: usize) -> Vec<String> {
         };
         for word in para.split_whitespace() {
             let w = width(word);
-            if line.is_empty() {
-                line.push_str(&open);
-                // Слово длиннее строки (путь, ссылка) рвём по месту: иначе оно
-                // одно растянет верстку и всё поедет.
-                if w > max {
-                    let mut rest = word.to_string();
-                    while width(&rest) > max {
-                        let head: String = take_width(&rest, max);
-                        rest = rest[head.len()..].to_string();
-                        open = sgr_open(&open, &head);
-                        line.push_str(&head);
-                        close(&mut line, &mut out, &open);
-                        line.push_str(&open);
-                    }
-                    line.push_str(&rest);
-                    open = sgr_open(&open, &rest);
-                } else {
-                    line.push_str(word);
-                    open = sgr_open(&open, word);
-                }
-            } else if width(&line) + 1 + w <= max {
+            if !line.is_empty() && width(&line) + 1 + w <= max {
                 line.push(' ');
                 line.push_str(word);
                 open = sgr_open(&open, word);
-            } else {
+                continue;
+            }
+            if !line.is_empty() {
+                close(&mut line, &mut out, &open);
+            }
+            line.push_str(&open);
+            // Слово длиннее строки (путь, ссылка) рвём по месту: иначе оно одно
+            // растянет вёрстку и всё поедет за край экрана.
+            let mut rest = word.to_string();
+            while width(&rest) > max {
+                let head = take_width(&rest, max);
+                rest = rest[head.len()..].to_string();
+                open = sgr_open(&open, &head);
+                line.push_str(&head);
                 close(&mut line, &mut out, &open);
                 line.push_str(&open);
-                line.push_str(word);
-                open = sgr_open(&open, word);
             }
+            line.push_str(&rest);
+            open = sgr_open(&open, &rest);
         }
         close(&mut line, &mut out, &open);
     }
@@ -1285,5 +1278,17 @@ mod tests {
         assert_eq!(many.matches("\x1b[7m").count(), 2, "{many:?}");
         // Пустой запрос ничего не трогает.
         assert_eq!(highlight(&c, "текст", "  "), "текст");
+    }
+    /// Длинное слово рвётся по ширине, где бы оно ни стояло: раньше это
+    /// работало только для первого слова строки, и путь во второй половине
+    /// сообщения уезжал за край экрана.
+    #[test]
+    fn a_long_word_breaks_anywhere_in_the_line() {
+        let path = "/очень/длинный/путь/до/сокета/узла/node.sock";
+        for line in wrap(&format!("сокет: {path}"), 20) {
+            assert!(width(&line) <= 20, "не влезло: {line:?} ({})", width(&line));
+        }
+        let joined: String = wrap(&format!("сокет: {path}"), 20).join("");
+        assert!(joined.contains("node.sock"), "потеряли хвост: {joined}");
     }
 }
