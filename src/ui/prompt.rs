@@ -8,7 +8,7 @@
 //! Разбор ответов вынесен в чистые функции — их и проверяют тесты; ввод-вывод
 //! остаётся тонкой оболочкой вокруг них.
 
-use crate::ui::style::{paint, rule, truncate, width, Caps, Role};
+use crate::ui::style::{pad, paint, rule, truncate, width, Caps, Role};
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::io::{IsTerminal, Write};
 
@@ -233,6 +233,18 @@ fn pick_act(code: KeyCode, mods: KeyModifiers) -> Option<Pick> {
     }
 }
 
+/// С какой строки показывать окно списка, чтобы выбранное было видно.
+///
+/// Держим выбранное в середине, как SelectList в pi: прижатый к краю выбор не
+/// даёт увидеть, что идёт следом. У краёв списка окно упирается — сверху в
+/// начало, снизу в конец, иначе под списком висел бы пустой хвост.
+fn window_start(pos: usize, len: usize, room: usize) -> usize {
+    if len <= room {
+        return 0;
+    }
+    pos.saturating_sub(room / 2).min(len - room)
+}
+
 /// Интерактивный выбор: стрелки, отбор набором, Enter.
 ///
 /// `Ok(None)` — человек передумал (Esc).
@@ -276,10 +288,20 @@ fn pick(
         out.push_str(&format!("{}\x1b[K\r\n", rule(caps, title)));
         let mut lines = 1usize;
         let room = 12.min(shown.len().max(1));
-        // Окно списка едет за выбранным: он обязан быть виден всегда, иначе
-        // стрелки двигают невидимое.
+        // Окно едет за выбранным, держа его В СЕРЕДИНЕ, как SelectList в pi:
+        // прижатый к краю выбор не даёт увидеть, что идёт следом.
         let pos = shown.iter().position(|i| *i == at).unwrap_or(0);
-        let from = pos.saturating_sub(room.saturating_sub(1));
+        let from = window_start(pos, shown.len(), room);
+        // Названия — колонкой: неровный левый край второго столбца читается
+        // как список случайных строк.
+        let labelw = shown
+            .iter()
+            .skip(from)
+            .take(room)
+            .map(|i| width(&items[*i].label))
+            .max()
+            .unwrap_or(12)
+            .clamp(12, 32);
         for i in shown.iter().copied().skip(from).take(room) {
             let c = &items[i];
             let mark = if i == at { "▸" } else { " " };
@@ -288,12 +310,24 @@ fn pick(
             } else {
                 paint(caps, Role::Text, &c.label)
             };
+            let room_for_hint = (caps.width as usize).saturating_sub(labelw + 8);
             let hint = if c.hint.is_empty() {
                 String::new()
             } else {
-                format!("  {}", paint(caps, Role::Dim, &truncate(&c.hint, 46)))
+                format!(
+                    "  {}",
+                    paint(caps, Role::Dim, &truncate(&c.hint, room_for_hint.max(12)))
+                )
             };
-            out.push_str(&format!("  {mark} {label}{hint}\x1b[K\r\n"));
+            out.push_str(&format!("  {mark} {}{hint}\x1b[K\r\n", pad(&label, labelw)));
+            lines += 1;
+        }
+        // Сколько всего и где мы — только когда список не поместился целиком.
+        if shown.len() > room {
+            out.push_str(&format!(
+                "    {}\x1b[K\r\n",
+                paint(caps, Role::Dim, &format!("{}/{}", pos + 1, shown.len()))
+            ));
             lines += 1;
         }
         if shown.is_empty() {
@@ -561,5 +595,16 @@ mod tests {
             pick_act(KeyCode::Esc, KeyModifiers::NONE),
             Some(Pick::Cancel)
         );
+    }
+    /// Окно списка обязано держать выбранное на виду и не свисать за края.
+    #[test]
+    fn the_window_keeps_the_choice_in_sight() {
+        // Список короче окна — показываем с начала.
+        assert_eq!(window_start(3, 5, 12), 0);
+        // В середине длинного списка выбранное стоит посередине окна.
+        assert_eq!(window_start(20, 40, 10), 15);
+        // У краёв окно упирается, а не свисает.
+        assert_eq!(window_start(0, 40, 10), 0);
+        assert_eq!(window_start(39, 40, 10), 30);
     }
 }

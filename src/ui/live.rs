@@ -2477,7 +2477,9 @@ fn draw_chat(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
     }
     let lines = chat::feed_lines(caps, &slice, total);
     for l in visible(&lines, rows, ui.scroll) {
-        push(out, l);
+        // Подсвечиваем найденное прямо в строке: без этого видно, что запись
+        // подошла, но не видно чем.
+        push(out, &crate::ui::style::highlight(caps, l, &filter));
     }
     if ui.scroll > 0 {
         push(

@@ -700,6 +700,70 @@ pub fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// Подсветить вхождения обратным цветом, не сломав уже наложенную краску.
+///
+/// Отбор в ленте показывает подходящие записи — но не говорит, ЧЕМ они
+/// подошли: в длинной строке искомое слово теряется. В pi найденное
+/// подсвечивается прямо в строке (alt-screen-search.ts), и здесь так же.
+///
+/// Ходим по кластерам: краска — кластеры нулевой ширины, их переносим как
+/// есть, а сравниваем только видимое. Иначе искомое «38» находилось бы внутри
+/// escape-последовательности цвета.
+pub fn highlight(caps: &Caps, line: &str, needle: &str) -> String {
+    if !caps.color || needle.trim().is_empty() {
+        return line.to_string();
+    }
+    let items: Vec<(usize, &str)> = clusters(line).collect();
+    // Плоский текст и карта «байт в плоском тексте → номер кластера».
+    let mut plain = String::new();
+    let mut at: Vec<usize> = Vec::new();
+    for (i, (w, text)) in items.iter().enumerate() {
+        if *w == 0 {
+            continue;
+        }
+        let low = text.to_lowercase();
+        for _ in 0..low.len() {
+            at.push(i);
+        }
+        plain.push_str(&low);
+    }
+    let needle = needle.trim().to_lowercase();
+    if needle.is_empty() || plain.is_empty() {
+        return line.to_string();
+    }
+    // Границы подсветки: номера кластеров, с которых она начинается и на
+    // которых заканчивается.
+    let mut on: Vec<usize> = Vec::new();
+    let mut off: Vec<usize> = Vec::new();
+    let mut from = 0usize;
+    while let Some(hit) = plain[from..].find(&needle) {
+        let start = from + hit;
+        let end = start + needle.len();
+        if let (Some(a), Some(b)) = (at.get(start), at.get(end - 1)) {
+            on.push(*a);
+            off.push(*b);
+        }
+        from = end.max(start + 1);
+        if from >= plain.len() {
+            break;
+        }
+    }
+    if on.is_empty() {
+        return line.to_string();
+    }
+    let mut out = String::new();
+    for (i, (_, text)) in items.iter().enumerate() {
+        if on.contains(&i) {
+            out.push_str("\x1b[7m");
+        }
+        out.push_str(text);
+        if off.contains(&i) {
+            out.push_str("\x1b[27m");
+        }
+    }
+    out
+}
+
 /// Дополнить пробелами до ширины (по видимой длине, не по байтам).
 pub fn pad(s: &str, to: usize) -> String {
     let w = width(s);
@@ -1205,5 +1269,21 @@ mod tests {
         }
         // Текст без краски переносится ровно как раньше.
         assert_eq!(wrap("раз два три", 7), vec!["раз два", "три"]);
+    }
+    /// Подсветка обязана попадать в буквы, а не в краску: искомое «38»
+    /// встречается внутри последовательности цвета, и наивный поиск подсветил
+    /// бы её.
+    #[test]
+    fn highlighting_lands_on_letters_not_on_colour_codes() {
+        let c = caps(true, true);
+        let painted = paint(&c, Role::Accent, "цвет 38 внутри");
+        let lit = highlight(&c, &painted, "38");
+        assert_eq!(strip(&lit), "цвет 38 внутри", "текст поехал: {lit:?}");
+        assert!(lit.contains("\x1b[7m38\x1b[27m"), "не подсвечено: {lit:?}");
+        // Регистр не важен, и подсвечиваются все вхождения.
+        let many = highlight(&c, "Раз два раз", "РАЗ");
+        assert_eq!(many.matches("\x1b[7m").count(), 2, "{many:?}");
+        // Пустой запрос ничего не трогает.
+        assert_eq!(highlight(&c, "текст", "  "), "текст");
     }
 }
