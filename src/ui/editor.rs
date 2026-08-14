@@ -42,6 +42,25 @@ impl Editor {
         &self.text
     }
 
+    /// Где каретка — в байтах от начала текста.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Заменить кусок `[from, каретка)` другим текстом.
+    ///
+    /// Дополнение подставляет слово ЦЕЛИКОМ: дописывать хвост к набранному
+    /// нельзя — человек мог поправить середину, и хвост встанет не туда.
+    pub fn replace_before(&mut self, from: usize, with: &str) {
+        let from = from.min(self.cursor);
+        if !self.text.is_char_boundary(from) || !self.text.is_char_boundary(self.cursor) {
+            return;
+        }
+        self.snapshot();
+        self.text.replace_range(from..self.cursor, with);
+        self.cursor = from + with.len();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text.trim().is_empty()
     }

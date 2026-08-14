@@ -412,8 +412,9 @@ pub fn width(s: &str) -> usize {
 
 /// Разбор строки на кластеры: (ширина, текст кластера).
 ///
-/// Управляющие последовательности (ANSI-цвет, OSC-ссылки) пропускаются целиком
-/// — места они не занимают, но в подсчёт лезут первыми.
+/// Управляющие последовательности (ANSI-цвет, OSC-ссылки) выходят кластерами
+/// нулевой ширины: в подсчёт они не идут, но обрезка обязана нести их с собой,
+/// иначе краска рвётся посреди последовательности.
 fn clusters(s: &str) -> impl Iterator<Item = (usize, &str)> {
     let bytes = s.as_char_indices_vec();
     ClusterIter {
@@ -463,7 +464,12 @@ impl<'a> Iterator for ClusterIter<'a> {
                                 break;
                             }
                         }
-                        continue;
+                        let to = self
+                            .chars
+                            .get(self.at)
+                            .map(|(i, _)| *i)
+                            .unwrap_or(self.s.len());
+                        return Some((0, &self.s[start..to]));
                     }
                 }
                 while self.at < self.chars.len() {
@@ -473,7 +479,12 @@ impl<'a> Iterator for ClusterIter<'a> {
                         break;
                     }
                 }
-                continue;
+                let to = self
+                    .chars
+                    .get(self.at)
+                    .map(|(i, _)| *i)
+                    .unwrap_or(self.s.len());
+                return Some((0, &self.s[start..to]));
             }
             if zero_width(c) {
                 // Одинокий нулевой символ: места не занимает.
@@ -587,7 +598,10 @@ fn char_width(c: char) -> usize {
 /// Снять краску: строка нужна как текст — например, чтобы положить её на
 /// подложку, где чужие сбросы цвета всё испортят.
 pub fn strip(s: &str) -> String {
-    clusters(s).map(|(_, t)| t).collect()
+    clusters(s)
+        .filter(|(w, _)| *w > 0)
+        .map(|(_, t)| t)
+        .collect()
 }
 
 /// Обрезать по видимой ширине, добавив многоточие.
@@ -600,15 +614,26 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
     let mut out = String::new();
     let mut w = 0;
-    for c in s.chars() {
-        let cw = char_width(c);
+    let mut painted = false;
+    for (cw, text) in clusters(s) {
+        if cw == 0 {
+            // Краска места не занимает — несём её с собой, иначе обрезок
+            // потеряет цвет, а то и оборвётся посреди последовательности.
+            out.push_str(text);
+            painted = true;
+            continue;
+        }
         if w + cw > max - 1 {
             break;
         }
-        out.push(c);
+        out.push_str(text);
         w += cw;
     }
     out.push('…');
+    // Обрезали до сброса — краска потечёт на весь остаток строки.
+    if painted && !out.ends_with("\x1b[0m") {
+        out.push_str("\x1b[0m");
+    }
     out
 }
 
@@ -1068,5 +1093,19 @@ mod tests {
         assert_eq!(meter(&c, 50, 4), "##..");
         assert_eq!(dot(&c, "waiting"), "?");
         assert!(rule(&c, "Сессии").chars().all(|ch| ch != '─'));
+    }
+    /// Обрезка крашеной строки: считать надо видимые знаки, а краску нести с
+    /// собой. Иначе цветная строка режется вчетверо раньше срока, а обрывок
+    /// последовательности выплёскивается на экран мусором.
+    #[test]
+    fn truncation_counts_letters_and_carries_the_colour() {
+        let c = caps(true, true);
+        let painted = paint(&c, Role::Accent, "длинная строка про всё на свете");
+        let cut = truncate(&painted, 10);
+        assert_eq!(width(&cut), 10, "видимая ширина обрезка: {cut:?}");
+        assert!(strip(&cut).starts_with("длинная"), "{:?}", strip(&cut));
+        assert!(cut.ends_with("\x1b[0m"), "краска не закрыта: {cut:?}");
+        // Некрашеная строка остаётся некрашеной.
+        assert_eq!(truncate("абвгде", 4), "абв…");
     }
 }

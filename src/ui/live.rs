@@ -27,7 +27,7 @@ use crate::ui::form::{Form, Kind};
 use crate::ui::render::{self, Window};
 use crate::ui::slash;
 use crate::ui::style::{band, header, key, pad, paint, truncate, width, Bg, Caps, Role};
-use crossterm::event::{poll, read, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{poll, read, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::io::Write;
 use std::time::Duration;
 
@@ -156,6 +156,12 @@ pub fn map_key(view_is_text: bool, k: KeyEvent) -> Act {
             _ => Act::Escape,
         };
     }
+    // Shift+Enter доезжает только там, где терминал говорит на kitty-протоколе
+    // (иначе он неотличим от простого Enter). Где доезжает — это самый
+    // привычный способ добавить строку, не отправляя.
+    if k.modifiers.contains(KeyModifiers::SHIFT) && k.code == KeyCode::Enter {
+        return Act::Newline;
+    }
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     if ctrl {
         return match k.code {
@@ -260,6 +266,14 @@ struct Ui {
     typing: Typing,
     status: String,
     scroll: usize,
+    /// Прокрутка справки, считаемая от её начала.
+    help_at: usize,
+    /// Дополнение упоминания по кругу: где «@», что набрали до первого Tab и
+    /// который из кандидатов сейчас подставлен.
+    ///
+    /// Без этого второй Tab считал бы подставленное «набранным» и уходил
+    /// вглубь первого каталога вместо того, чтобы показать соседний.
+    tab_cycle: Option<(usize, String, usize)>,
     feed: Option<Feed>,
     items: Vec<Item>,
     open_id: String,
@@ -312,6 +326,8 @@ impl Default for Ui {
             typing: Typing::None,
             status: String::new(),
             scroll: 0,
+            help_at: 0,
+            tab_cycle: None,
             feed: None,
             items: Vec::new(),
             open_id: String::new(),
@@ -399,6 +415,9 @@ pub async fn run(app: &App, machine_name: &str) -> Result<(), String> {
         // 1. Клавиши — первым делом: отклик важнее свежести данных.
         while poll(TICK).map_err(|e| e.to_string())? {
             let act = match read().map_err(|e| e.to_string())? {
+                // Kitty-протокол отдаёт и отпускания клавиш — на них
+                // реагировать нельзя: одно нажатие Enter приезжало бы дважды.
+                Event::Key(k) if k.kind == KeyEventKind::Release => continue,
                 Event::Key(k) => map_key(typing_now(&ui), k),
                 // Вставка приходит целым куском — так её и кладём в поле.
                 Event::Paste(text) => Act::Paste(text),
@@ -605,6 +624,120 @@ fn arg_palette(ui: &Ui, list: &[Session]) -> Vec<String> {
     slash::rank(part, &cands)
 }
 
+/// Упоминание файла под кареткой: (где начинается «@», что набрано после).
+///
+/// Ссылка на файл в сообщении — это половина всех сообщений агенту: «посмотри
+/// @src/ui/live.rs». Набирать путь по памяти неоткуда, поэтому «@» открывает
+/// список того, что лежит под руками, — как файловые упоминания в pi.
+///
+/// Упоминанием считаем только отдельное слово: почта в тексте («пиши на
+/// a@b.ru») не должна превращаться в поиск по диску.
+pub fn at_mention(line: &str, cursor: usize) -> Option<(usize, String)> {
+    let cut = cursor.min(line.len());
+    if !line.is_char_boundary(cut) {
+        return None;
+    }
+    let head = &line[..cut];
+    let at = head.rfind('@')?;
+    let ok_before = head[..at]
+        .chars()
+        .next_back()
+        .map(char::is_whitespace)
+        .unwrap_or(true);
+    if !ok_before {
+        return None;
+    }
+    let part = &head[at + 1..];
+    if part.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some((at, part.to_string()))
+}
+
+/// Что подставить в упоминание: общий кусок, а если общего нет — следующего по
+/// кругу. Второе значение — номер в круге; `None` значит «выбор однозначен».
+///
+/// Отдельной функцией, потому что это единственное место, где Tab способен
+/// подставить не то: круг обязан идти от НАБРАННОГО, а не от подставленного.
+fn mention_pick(
+    typed: &str,
+    cands: &[String],
+    prev: Option<usize>,
+) -> Option<(String, Option<usize>)> {
+    if cands.is_empty() {
+        return None;
+    }
+    if let Some(done) = slash::complete_arg(typed, cands) {
+        if done != typed {
+            return Some((done, None));
+        }
+    }
+    let i = prev.map(|i| (i + 1) % cands.len()).unwrap_or(0);
+    Some((cands[i].clone(), Some(i)))
+}
+
+/// Откуда считать пути упоминаний: каталог открытой сессии, если он тут есть.
+///
+/// Сессия может жить на другой машине — тогда её каталога на этом диске нет, и
+/// врать подсказками нельзя: остаёмся в текущем каталоге.
+fn mention_base(ui: &Ui, list: &[Session]) -> std::path::PathBuf {
+    let here = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let Some(s) = list.iter().find(|s| s.id == ui.open_id) else {
+        return here;
+    };
+    match s.cwd.as_deref().map(crate::core::util::expand_tilde) {
+        Some(p) if p.is_dir() => p,
+        _ => here,
+    }
+}
+
+/// Что лежит рядом: файлы и каталоги под `base`, подходящие под набранное.
+///
+/// Каталоги идут первыми и с косой чертой на конце — по ним ходят дальше, а не
+/// упоминают их. Скрытое показываем, только когда его спросили точкой.
+fn file_candidates(base: &std::path::Path, part: &str) -> Vec<String> {
+    let (dir_part, prefix) = match part.rfind('/') {
+        Some(i) => (&part[..=i], &part[i + 1..]),
+        None => ("", part),
+    };
+    let Ok(entries) = std::fs::read_dir(base.join(dir_part)) else {
+        return Vec::new();
+    };
+    let low = prefix.to_lowercase();
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    let mut fuzzy: Vec<String> = Vec::new();
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') && !prefix.starts_with('.') {
+            continue;
+        }
+        if name == "target" || name == "node_modules" {
+            continue;
+        }
+        let is_dir = e.path().is_dir();
+        let shown = format!("{dir_part}{name}{}", if is_dir { "/" } else { "" });
+        if prefix.is_empty() || name.to_lowercase().starts_with(&low) {
+            if is_dir {
+                dirs.push(shown);
+            } else {
+                files.push(shown);
+            }
+        } else if crate::ui::slash::fuzzy_score(prefix, &name).is_some() {
+            fuzzy.push(shown);
+        }
+    }
+    dirs.sort();
+    files.sort();
+    fuzzy.sort();
+    // Похожие — в конец: точное начало имени человек имел в виду с большей
+    // вероятностью, чем совпадение вразбивку.
+    dirs.extend(files);
+    dirs.extend(fuzzy);
+    dirs.truncate(30);
+    dirs
+}
+
 /// Что подставлять вторым словом команды: живые сессии, каталоги, слова.
 ///
 /// Кандидаты берём из того, что человек видит прямо сейчас: список сессий
@@ -760,6 +893,11 @@ async fn handle(
     tx: &tokio::sync::mpsc::Sender<Msg>,
 ) -> bool {
     let cur = list.get(ui.sel).cloned();
+    // Круг дополнений живёт только между подряд идущими Tab: любое другое
+    // нажатие означает, что человек передумал.
+    if act != Act::Tab {
+        ui.tab_cycle = None;
+    }
     match act {
         Act::Quit => return false,
         // Отмена набора — отдельный шаг: Esc в наборе не должен ещё и
@@ -812,6 +950,15 @@ async fn handle(
         Act::Down if ui.view == View::Chat && ui.input.in_history() => {
             ui.input.history_next();
         }
+        // Справку читают сверху вниз — у неё своя прокрутка, считаемая от
+        // начала. У ленты она считается от конца, и общая арифметика тут
+        // означала бы, что справка открывается на последней строке.
+        Act::Up if ui.view == View::Help => ui.help_at = ui.help_at.saturating_sub(1),
+        Act::Down if ui.view == View::Help => ui.help_at += 1,
+        Act::PageUp if ui.view == View::Help => ui.help_at = ui.help_at.saturating_sub(10),
+        Act::PageDown if ui.view == View::Help => ui.help_at += 10,
+        Act::Top if ui.view == View::Help => ui.help_at = 0,
+        Act::Bottom if ui.view == View::Help => ui.help_at = usize::MAX / 2,
         Act::Up => match ui.view {
             View::List => ui.sel = ui.sel.saturating_sub(1),
             View::Chat => ui.scroll += 1,
@@ -1183,8 +1330,43 @@ async fn handle(
         Act::Delete => ui.input.delete(),
         Act::Newline => ui.input.newline(),
         Act::Tab => {
-            // Дополняем только команду: в тексте сообщения Tab — это Tab.
             let line = ui.input.text().to_string();
+            // Упоминание файла дополняем в любом тексте: «@» человек ставит
+            // именно затем, чтобы не набирать путь целиком.
+            if ui.typing != Typing::Command {
+                if let Some((at, part)) = at_mention(&line, ui.input.cursor()) {
+                    // Набранное берём из круга, если он идёт: подставленное
+                    // «scripts/» — это не то, что человек набрал.
+                    let typed = match &ui.tab_cycle {
+                        Some((was_at, typed, _)) if *was_at == at => typed.clone(),
+                        _ => part.clone(),
+                    };
+                    let cands = file_candidates(&mention_base(ui, list), &typed);
+                    if cands.is_empty() {
+                        ui.status = "такого файла рядом нет".into();
+                        return true;
+                    }
+                    let prev = match &ui.tab_cycle {
+                        Some((was_at, _, i)) if *was_at == at => Some(*i),
+                        _ => None,
+                    };
+                    let Some((put, next)) = mention_pick(&typed, &cands, prev) else {
+                        return true;
+                    };
+                    // Пробел ставим только когда выбор однозначен: он
+                    // закрывает упоминание, а пока идём по кругу — закрывать
+                    // рано, следующий Tab должен показать соседний файл.
+                    let tail = if put.ends_with('/') || next.is_some() {
+                        ""
+                    } else {
+                        " "
+                    };
+                    ui.input.replace_before(at, &format!("@{put}{tail}"));
+                    ui.tab_cycle = next.map(|i| (at, typed, i));
+                    return true;
+                }
+            }
+            // Дальше дополняем только команду: в тексте сообщения Tab — это Tab.
             if !line.starts_with('/') {
                 return true;
             }
@@ -1395,6 +1577,7 @@ async fn handle(
             } else {
                 ui.prev = ui.view.clone();
                 ui.view = View::Help;
+                ui.help_at = 0;
             }
         }
         Act::None => {}
@@ -1441,6 +1624,7 @@ async fn run_slash(
         "help" => {
             ui.prev = ui.view.clone();
             ui.view = View::Help;
+            ui.help_at = 0;
         }
         "list" | "ls" => {
             ui.view = View::List;
@@ -1757,7 +1941,7 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
             View::Loop => draw_loop(&mut out, caps, ui, body),
             View::Bundles => draw_bundles(&mut out, caps, ui, body),
             View::Bundle => draw_bundle(&mut out, caps, ui, body),
-            View::Help => draw_help(&mut out, caps),
+            View::Help => draw_help(&mut out, caps, ui, body),
         }
     }
 
@@ -1795,11 +1979,42 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
     // Аргумент набирают — показываем подходящие значения, а не список команд:
     // «какие вообще бывают» человек спрашивает один раз, а «что подставить
     // сюда» — каждый раз.
-    let arg_hits = arg_palette(ui, list);
+    // Упоминание файла набирают чаще, чем команду, — его список идёт первым.
+    let (mentions, at_cycle) = if typing_now(ui) && ui.typing != Typing::Command {
+        match at_mention(ui.input.text(), ui.input.cursor()) {
+            Some((at, part)) => {
+                // Пока идёт круг дополнений, список считаем по НАБРАННОМУ, а не
+                // по подставленному: иначе он схлопывается в один пункт и
+                // человек не видит, между чем ходит.
+                let (typed, at_cycle) = match &ui.tab_cycle {
+                    Some((was, typed, i)) if *was == at => (typed.clone(), Some(*i)),
+                    _ => (part, None),
+                };
+                (file_candidates(&mention_base(ui, list), &typed), at_cycle)
+            }
+            None => (Vec::new(), None),
+        }
+    } else {
+        (Vec::new(), None)
+    };
+    for (i, c) in mentions.iter().enumerate().take(6) {
+        let role = if at_cycle == Some(i) {
+            Role::Accent
+        } else {
+            Role::Muted
+        };
+        let mark = if at_cycle == Some(i) { "▸" } else { " " };
+        push(&mut out, &format!(" {mark} {}", paint(caps, role, c)));
+    }
+    let arg_hits = if mentions.is_empty() {
+        arg_palette(ui, list)
+    } else {
+        Vec::new()
+    };
     for c in arg_hits.iter().take(6) {
         push(&mut out, &format!("  {}", paint(caps, Role::Muted, c)));
     }
-    let hits = if arg_hits.is_empty() {
+    let hits = if arg_hits.is_empty() && mentions.is_empty() {
         palette(ui)
     } else {
         Vec::new()
@@ -2508,21 +2723,142 @@ fn draw_bundle(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
     }
 }
 
-fn draw_help(out: &mut String, caps: &Caps) {
-    for (k, what) in [
-        ("↑ ↓ / k j", "выбрать сессию"),
-        ("Enter", "открыть чат; в чате — отправить набранное"),
-        ("s", "экран сессии как есть"),
-        ("x", "прервать агента (Escape ему в пану)"),
-        ("1…9", "ответить вариантом на вопрос с меню"),
-        ("l / b", "циклы / связки"),
-        ("Esc", "назад; в чате с набранным — стереть набранное"),
-        ("Ctrl-U", "стереть строку ввода"),
-        ("q / Ctrl-C", "выход"),
-    ] {
+/// Разделы справки: заголовок и пары «клавиша — что делает».
+///
+/// Держим их таблицей, а не печатью по месту: справка обязана совпадать с
+/// раскладкой из `map_key`, и это единственный список, который придётся
+/// править вместе с ней. Про это есть тест.
+fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+    vec![
+        (
+            "Ходить",
+            vec![
+                ("↑ ↓ / k j", "выбрать строку"),
+                ("Enter", "открыть; в чате — отправить набранное"),
+                ("PgUp PgDn", "листать ленту"),
+                ("Home End", "к началу ленты и к свежему"),
+                ("f / Ctrl-F", "отбор: набери — останутся похожие"),
+                ("l / b", "циклы / связки"),
+                ("s", "экран сессии как есть"),
+                ("Esc", "назад"),
+                ("? / h", "эта справка"),
+                ("q / Ctrl-C", "выход"),
+            ],
+        ),
+        (
+            "Делать",
+            vec![
+                ("x", "прервать агента"),
+                ("1…9", "ответить вариантом на вопрос с меню"),
+                ("m", "влить ветку"),
+                ("p", "пауза связки"),
+                ("n", "новая рука"),
+                ("d", "удалить"),
+                ("/", "командная строка; Tab — дополнить"),
+            ],
+        ),
+        (
+            "Править ввод",
+            vec![
+                ("Alt-Enter", "перевод строки (и Shift-Enter, и Ctrl-O)"),
+                ("Ctrl-A / Ctrl-E", "в начало и в конец строки"),
+                ("Alt-← / Alt-→", "по словам (они же Alt-B / Alt-F)"),
+                ("Ctrl-W / Alt-D", "стереть слово влево / вправо"),
+                ("Ctrl-K / Ctrl-U", "стереть до конца / всю строку"),
+                ("Ctrl-Y / Alt-Y", "вернуть стёртое; листать кольцо"),
+                ("Ctrl-Z", "отменить правку"),
+                ("Ctrl-X", "дописать в $EDITOR"),
+                ("↑ ↓", "прошлые отправленные сообщения"),
+                ("@", "подставить путь к файлу"),
+            ],
+        ),
+    ]
+}
+
+/// Справка: разделы в две колонки, если окно позволяет.
+///
+/// В одну колонку она не влезает в обычные двадцать четыре строки, а справка,
+/// которую надо листать, чтобы узнать про листание, — насмешка. Поэтому при
+/// широком окне разделы встают рядом; при узком остаётся прокрутка.
+fn draw_help(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
+    let total = caps.width as usize;
+    let sections = help_sections();
+    // Ширину считаем по КОЛОНКЕ, а не по всей справке: длинная подпись из
+    // правого раздела не должна раздвигать левый.
+    let side_of =
+        |from: usize, to: usize| -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+            sections[from..to.min(sections.len())].to_vec()
+        };
+    let block =
+        |secs: &[(&'static str, Vec<(&'static str, &'static str)>)]| -> (Vec<String>, usize) {
+            let keyw = secs
+                .iter()
+                .flat_map(|(_, r)| r.iter())
+                .map(|(k, _)| width(k))
+                .max()
+                .unwrap_or(8);
+            let descw = secs
+                .iter()
+                .flat_map(|(_, r)| r.iter())
+                .map(|(_, w)| width(w))
+                .max()
+                .unwrap_or(20);
+            let mut lines = Vec::new();
+            for (title, rows) in secs {
+                if !lines.is_empty() {
+                    lines.push(String::new());
+                }
+                lines.push(format!("  {}", paint(caps, Role::Text, title)));
+                for (k, what) in rows {
+                    lines.push(format!(
+                        "  {}  {}",
+                        pad(&paint(caps, Role::Accent, k), keyw),
+                        paint(caps, Role::Dim, what)
+                    ));
+                }
+            }
+            (lines, keyw + descw + 4)
+        };
+
+    let (left, lw) = block(&side_of(0, 2));
+    let (right, rw) = block(&side_of(2, sections.len()));
+    let mut lines: Vec<String> = Vec::new();
+    if lw + rw + 2 <= total && !right.is_empty() {
+        for i in 0..left.len().max(right.len()) {
+            let l = left.get(i).cloned().unwrap_or_default();
+            let r = right.get(i).cloned().unwrap_or_default();
+            if r.is_empty() {
+                lines.push(l);
+            } else {
+                lines.push(format!("{}{}", pad(&l, lw + 2), r));
+            }
+        }
+    } else {
+        let (all, _) = block(&sections);
+        lines = all;
+    }
+    // Узкое окно: подписи режем, чтобы строка не переносилась — перенос сдвинул
+    // бы весь кадр и терминал начал бы прокручиваться.
+    let lines: Vec<String> = lines.iter().map(|l| truncate(l, total)).collect();
+
+    let clipped = lines.len() > rows;
+    let room = if clipped {
+        rows.saturating_sub(1)
+    } else {
+        rows
+    };
+    let at = ui.help_at.min(lines.len().saturating_sub(room));
+    for line in lines.iter().skip(at).take(room) {
+        push(out, line);
+    }
+    if clipped {
         push(
             out,
-            &format!("  {}  {}", pad(k, 12), paint(caps, Role::Dim, what)),
+            &paint(
+                caps,
+                Role::Muted,
+                " ↑↓ листать · home — в начало · esc — назад",
+            ),
         );
     }
 }
@@ -2535,7 +2871,10 @@ fn push(out: &mut String, line: &str) {
 
 /// Сырой режим с гарантированным восстановлением: брошенный терминал без эха —
 /// худшее, что программа может оставить после себя.
-struct RawGuard(bool);
+struct RawGuard {
+    raw: bool,
+    kitty: bool,
+}
 
 impl RawGuard {
     fn enable() -> Self {
@@ -2547,14 +2886,37 @@ impl RawGuard {
         // нажатий, и первый же перевод строки уходит отправкой недописанного.
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
         let _ = std::io::stdout().flush();
-        Self(crossterm::terminal::enable_raw_mode().is_ok())
+        let raw = crossterm::terminal::enable_raw_mode().is_ok();
+        // Kitty keyboard protocol: терминалы, которые его понимают, начинают
+        // различать Shift+Enter и Enter, Ctrl+Enter и Ctrl+J. Просим ровно
+        // «различать коды» — сообщать о нажатии и отпускании не просим, иначе
+        // каждое нажатие приехало бы дважды. Умеет не всякий терминал, поэтому
+        // спрашиваем разрешения, а не ломимся: где нет — работаем как раньше.
+        let kitty = raw && crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+        if kitty {
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                )
+            );
+        }
+        Self { raw, kitty }
     }
 }
 
 impl Drop for RawGuard {
     fn drop(&mut self) {
+        // Флаги снимаем ДО выхода из сырого режима и обязательно: оставленный
+        // kitty-протокол ломает следующую программу в этом терминале.
+        if self.kitty {
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::event::PopKeyboardEnhancementFlags
+            );
+        }
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
-        if self.0 {
+        if self.raw {
             let _ = crossterm::terminal::disable_raw_mode();
         }
         // Курсор вернуть обязаны, даже если дальше паника: терминал без
@@ -3137,5 +3499,98 @@ mod tests {
         assert_eq!(visible(&items, 3, 100), &[1]);
         assert!(visible(&items, 0, 0).is_empty());
         assert!(visible::<u32>(&[], 5, 0).is_empty());
+    }
+    /// Справка в широком окне встаёт в две колонки: иначе она не влезает в
+    /// экран и её приходится листать, чтобы прочитать про листание.
+    #[test]
+    fn help_stands_in_two_columns_when_the_window_is_wide() {
+        let mut caps = frame_caps();
+        caps.width = 120;
+        let mut out = String::new();
+        let ui = Ui::default();
+        draw_help(&mut out, &caps, &ui, 40);
+        let joined: Vec<&str> = out.lines().collect();
+        let both = joined
+            .iter()
+            .find(|l| l.contains("выбрать строку") && l.contains("Alt-Enter"));
+        assert!(both.is_some(), "две колонки не сложились:\n{out}");
+        // И в узком окне — одна колонка, без переносов.
+        caps.width = 60;
+        let mut narrow = String::new();
+        draw_help(&mut narrow, &caps, &ui, 40);
+        assert!(narrow.lines().all(|l| width(l) <= 60), "{narrow}");
+    }
+    /// «@» — это ссылка на файл, но только когда стоит отдельным словом:
+    /// иначе почта в сообщении превращалась бы в поиск по диску.
+    #[test]
+    fn a_mention_is_a_separate_word() {
+        let line = "посмотри @src/ui";
+        let at = line.find('@').unwrap();
+        assert_eq!(
+            at_mention(line, line.len()),
+            Some((at, "src/ui".to_string()))
+        );
+        assert_eq!(at_mention("@", 1), Some((0, String::new())));
+        assert_eq!(at_mention("пиши на a@b.ru", "пиши на a@b.ru".len()), None);
+        // Курсор ушёл за слово — упоминания под ним больше нет.
+        assert_eq!(at_mention("@src файл", "@src файл".len()), None);
+    }
+
+    /// Список подсказок — то, что лежит рядом: каталоги первыми, мусор мимо.
+    #[test]
+    fn mentions_offer_what_lies_next_to_you() {
+        let dir = std::env::temp_dir().join(format!("jarvis-mention-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "").unwrap();
+        std::fs::write(dir.join(".hidden"), "").unwrap();
+        let all = file_candidates(&dir, "");
+        assert_eq!(all.first().map(String::as_str), Some("src/"), "{all:?}");
+        assert!(all.contains(&"Cargo.toml".to_string()), "{all:?}");
+        assert!(!all.iter().any(|c| c.starts_with("target")), "{all:?}");
+        assert!(!all.iter().any(|c| c.starts_with(".hidden")), "{all:?}");
+        // Точкой скрытое спрашивают явно.
+        assert_eq!(file_candidates(&dir, ".hid"), vec![".hidden".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// Набранное «@» обязано показать список рядом лежащего — иначе про него
+    /// никто не узнает.
+    #[test]
+    fn a_mention_shows_the_neighbours_right_in_the_frame() {
+        let mut ui = Ui {
+            view: View::Chat,
+            typing: Typing::Message,
+            ..Default::default()
+        };
+        ui.input.set("посмотри @sr");
+        let f = frame(&frame_caps(), "local", &ui, &[], 30);
+        assert!(f.contains("src/"), "нет подсказки про src/:\n{f}");
+    }
+    /// Tab по упоминанию: сперва общий кусок, а если общего нет — по кругу, и
+    /// круг обязан замкнуться, а не упереться в последний пункт.
+    #[test]
+    fn tab_completes_the_common_part_and_then_walks_in_a_circle() {
+        let cands = vec!["src/".to_string(), "srv/".to_string()];
+        // Общий кусок длиннее набранного — подставляем его, не выбирая за
+        // человека.
+        assert_eq!(
+            mention_pick("s", &cands, None),
+            Some(("sr".to_string(), None))
+        );
+        // Общего больше нет — идём по кругу и возвращаемся к началу.
+        assert_eq!(
+            mention_pick("sr", &cands, None),
+            Some(("src/".to_string(), Some(0)))
+        );
+        assert_eq!(
+            mention_pick("sr", &cands, Some(0)),
+            Some(("srv/".to_string(), Some(1)))
+        );
+        assert_eq!(
+            mention_pick("sr", &cands, Some(1)),
+            Some(("src/".to_string(), Some(0)))
+        );
+        assert_eq!(mention_pick("sr", &[], None), None);
     }
 }
