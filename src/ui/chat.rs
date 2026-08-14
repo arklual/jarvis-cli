@@ -8,7 +8,7 @@
 use crate::app::App;
 use crate::core::node::NodeClient;
 use crate::core::util::{clock, ellipsize, one_line};
-use crate::ui::style::{accent, band, paint, truncate, width, wrap, Bg, Caps, Role};
+use crate::ui::style::{accent, band, pad, paint, truncate, width, wrap, Bg, Caps, Role};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -161,6 +161,8 @@ pub enum Md {
     Quote(String),
     /// Горизонтальная черта.
     Rule,
+    /// Таблица: первая строка — шапка.
+    Table(Vec<Vec<String>>),
 }
 
 /// Разобрать текст ответа в строки разметки.
@@ -170,9 +172,12 @@ pub enum Md {
 pub fn markdown(text: &str) -> Vec<Md> {
     let mut out = Vec::new();
     let mut in_code = false;
-    for raw in text.lines() {
-        let line = raw.trim_end();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i].trim_end();
         let t = line.trim_start();
+        i += 1;
         if let Some(rest) = t.strip_prefix("```") {
             if in_code {
                 out.push(Md::CodeEnd);
@@ -184,6 +189,21 @@ pub fn markdown(text: &str) -> Vec<Md> {
         }
         if in_code {
             out.push(Md::Code(line.to_string()));
+            continue;
+        }
+        // Таблица узнаётся по второй строке — рамке из чёрточек. Без неё
+        // «|» посреди текста остаётся «|».
+        if t.starts_with('|') && lines.get(i).is_some_and(|n| is_table_rule(n)) {
+            let mut rows = vec![table_row(t)];
+            i += 1;
+            while let Some(next) = lines.get(i) {
+                if !next.trim_start().starts_with('|') {
+                    break;
+                }
+                rows.push(table_row(next.trim()));
+                i += 1;
+            }
+            out.push(Md::Table(rows));
             continue;
         }
         // Черта разделяет части ответа — она и на экране черта, а не три
@@ -218,6 +238,24 @@ pub fn markdown(text: &str) -> Vec<Md> {
         }
     }
     out
+}
+
+/// Строка-рамка таблицы: `|---|:--:|`.
+fn is_table_rule(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|')
+        && t.contains('-')
+        && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+}
+
+/// Ячейки строки таблицы, без крайних палок.
+fn table_row(line: &str) -> Vec<String> {
+    line.trim()
+        .trim_start_matches('|')
+        .trim_end_matches('|')
+        .split('|')
+        .map(|c| c.trim().to_string())
+        .collect()
 }
 
 /// «1. пункт» → (1, «пункт»).
@@ -310,6 +348,73 @@ fn inline(caps: &Caps, s: &str, base: Role) -> String {
         i += 1;
     }
     flush(caps, base, &mut plain, &mut out);
+    out
+}
+
+/// Таблица колонками: ширина считается по содержимому, шапка — весом.
+///
+/// Разметку таблиц агенты используют часто, а в ленте она выглядела как
+/// частокол палок: `| файл | строк |`. Колонки читаются, палки — нет.
+///
+/// Если ширины не хватает, колонки ужимаются пропорционально — но не уже
+/// восьми ячеек: колонка в три знака не показывает ничего.
+fn table(caps: &Caps, rows: &[Vec<String>], room: usize) -> Vec<String> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if cols == 0 {
+        return Vec::new();
+    }
+    let mut w: Vec<usize> = (0..cols)
+        .map(|c| {
+            rows.iter()
+                .filter_map(|r| r.get(c))
+                .map(|s| width(s))
+                .max()
+                .unwrap_or(0)
+                .max(1)
+        })
+        .collect();
+    // Общая ширина с разделителями «  ». Не влезли — ужимаем самые широкие.
+    let gap = 2;
+    let total = |w: &[usize]| w.iter().sum::<usize>() + gap * (cols.saturating_sub(1));
+    while total(&w) > room {
+        let Some((at, _)) = w.iter().enumerate().max_by_key(|(_, v)| **v) else {
+            break;
+        };
+        if w[at] <= 8 {
+            break;
+        }
+        w[at] -= 1;
+    }
+    let mut out = Vec::new();
+    for (n, row) in rows.iter().enumerate() {
+        let mut line = String::from("  ");
+        for c in 0..cols {
+            let cell = row.get(c).map(String::as_str).unwrap_or("");
+            let cell = truncate(cell, w[c]);
+            let painted = if n == 0 {
+                accent(caps, Role::Text, &[1], &cell)
+            } else {
+                inline(caps, &cell, Role::Text)
+            };
+            line.push_str(&pad(&painted, w[c]));
+            if c + 1 < cols {
+                line.push_str("  ");
+            }
+        }
+        out.push(line.trim_end().to_string());
+        if n == 0 {
+            // Черта под шапкой — граница между «что это» и «что там».
+            let rule: String = w
+                .iter()
+                .map(|x| "─".repeat(*x))
+                .collect::<Vec<_>>()
+                .join("  ");
+            out.push(format!("  {}", paint(caps, Role::Border, &rule)));
+        }
+    }
     out
 }
 
@@ -438,6 +543,7 @@ pub fn block(caps: &Caps, it: &Item, total: usize) -> Vec<String> {
                             out.push(format!("  {} {}", paint(caps, Role::Border, "│"), l));
                         }
                     }
+                    Md::Table(rows) => out.extend(table(caps, &rows, room)),
                     Md::Rule => out.push(format!(
                         "  {}",
                         paint(caps, Role::Border, &"─".repeat(room.min(60)))
@@ -956,5 +1062,38 @@ mod tests {
         .len();
         assert_eq!(before, 0);
         assert_eq!(grew, after - user_only, "поправка разошлась с лентой");
+    }
+    /// Таблица обязана стать колонками: частокол палок в ленте не читается.
+    #[test]
+    fn a_table_becomes_columns() {
+        let md = markdown("| файл | строк |\n|---|---:|\n| main.rs | 120 |\n| ui.rs | 8 |\nпосле");
+        let Some(Md::Table(rows)) = md.first() else {
+            panic!("таблица не разобралась: {md:?}");
+        };
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[0], vec!["файл", "строк"]);
+        assert_eq!(rows[2], vec!["ui.rs", "8"]);
+        // Текст после таблицы остаётся текстом.
+        assert!(
+            matches!(md.last(), Some(Md::Plain(t)) if t == "после"),
+            "{md:?}"
+        );
+
+        let c = colored_caps();
+        let lines = table(&c, rows, 40);
+        let plain: Vec<String> = lines.iter().map(|l| crate::ui::style::strip(l)).collect();
+        assert!(plain[0].contains("файл") && plain[0].contains("строк"));
+        assert!(plain[1].contains("─"), "нет черты под шапкой: {plain:?}");
+        // Колонки выровнены: «main.rs» и «ui.rs» начинаются в одном столбце.
+        let at = |s: &str, sub: &str| s.find(sub).map(|i| crate::ui::style::width(&s[..i]));
+        assert_eq!(at(&plain[2], "120"), at(&plain[3], "8"), "{plain:?}");
+    }
+
+    /// Палка посреди текста таблицей не считается: без рамки из чёрточек это
+    /// просто знак.
+    #[test]
+    fn a_pipe_in_a_sentence_is_not_a_table() {
+        let md = markdown("ставь | между ними\n| и так |");
+        assert!(!md.iter().any(|m| matches!(m, Md::Table(_))), "{md:?}");
     }
 }
