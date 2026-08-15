@@ -198,6 +198,8 @@ enum Pick {
     Cancel,
     Back,
     Clear,
+    /// Отметить или снять отметку — в списке, где выбирают несколько.
+    Toggle,
     Type(char),
 }
 
@@ -228,6 +230,7 @@ fn pick_act(code: KeyCode, mods: KeyModifiers) -> Option<Pick> {
             'e' => Some(Pick::Bottom),
             _ => None,
         },
+        KeyCode::Char(' ') => Some(Pick::Toggle),
         KeyCode::Char(c) => Some(Pick::Type(c)),
         _ => None,
     }
@@ -254,6 +257,27 @@ fn pick(
     items: &[Choice],
     default: usize,
 ) -> Result<Option<usize>, String> {
+    Ok(run_pick(caps, title, items, default, false)?.and_then(|v| v.first().copied()))
+}
+
+/// Тот же список, но отмечают в нём несколько: пробел ставит и снимает
+/// отметку, Enter заканчивает.
+///
+/// Гейты выбирают именно так — «номера через запятую» рядом со списком,
+/// который листают стрелками, выглядели как две разные программы.
+fn pick_many(caps: &Caps, title: &str, items: &[Choice]) -> Result<Option<Vec<usize>>, String> {
+    run_pick(caps, title, items, 0, true)
+}
+
+/// Общий список: одиночный выбор и выбор нескольких отличаются только
+/// отметками и тем, что возвращают.
+fn run_pick(
+    caps: &Caps,
+    title: &str,
+    items: &[Choice],
+    default: usize,
+    multi: bool,
+) -> Result<Option<Vec<usize>>, String> {
     use crossterm::event::{poll, read, Event};
     if items.is_empty() {
         return Ok(None);
@@ -262,6 +286,7 @@ fn pick(
     print!("\x1b[?25l");
     let mut filter = String::new();
     let mut at = default.min(items.len() - 1);
+    let mut marked: Vec<bool> = vec![false; items.len()];
     let mut drawn = 0usize;
     let result = loop {
         // Отбор по похожести — тот же, что в окне: человек набирает три буквы,
@@ -332,6 +357,13 @@ fn pick(
                 }
             }
             let mark = if i == at { "▸" } else { " " };
+            let box_ = if !multi {
+                String::new()
+            } else if marked[i] {
+                format!("{} ", paint(caps, Role::Ok, "[×]"))
+            } else {
+                format!("{} ", paint(caps, Role::Dim, "[ ]"))
+            };
             let label = if i == at {
                 paint(caps, Role::Accent, &c.label)
             } else {
@@ -346,7 +378,10 @@ fn pick(
                     paint(caps, Role::Dim, &truncate(&c.hint, room_for_hint.max(12)))
                 )
             };
-            out.push_str(&format!("  {mark} {}{hint}\x1b[K\r\n", pad(&label, labelw)));
+            out.push_str(&format!(
+                "  {mark} {box_}{}{hint}\x1b[K\r\n",
+                pad(&label, labelw)
+            ));
             lines += 1;
         }
         // Сколько всего и где мы — только когда список не поместился целиком.
@@ -370,7 +405,11 @@ fn pick(
             paint(
                 caps,
                 Role::Dim,
-                "↑↓ выбор · ↵ взять · esc отмена · набирай — отбор  "
+                if multi {
+                    "↑↓ ходить · пробел отметить · ↵ готово · esc отмена  "
+                } else {
+                    "↑↓ выбор · ↵ взять · esc отмена · набирай — отбор  "
+                }
             ),
             paint(caps, Role::Accent, &filter)
         ));
@@ -394,7 +433,17 @@ fn pick(
         let Event::Key(k) = ev else { continue };
         match pick_act(k.code, k.modifiers) {
             Some(Pick::Cancel) => break None,
-            Some(Pick::Take) => break Some(at),
+            Some(Pick::Take) if multi => {
+                break Some(
+                    (0..items.len())
+                        .filter(|i| marked[*i])
+                        .collect::<Vec<usize>>(),
+                )
+            }
+            Some(Pick::Take) => break Some(vec![at]),
+            Some(Pick::Toggle) if multi => marked[at] = !marked[at],
+            // Там, где отмечать нечего, пробел — обычный знак отбора.
+            Some(Pick::Toggle) => filter.push(' '),
             Some(Pick::Up) => {
                 let pos = shown.iter().position(|i| *i == at).unwrap_or(0);
                 // По кругу: у списка из трёх пунктов «вверх» с первого должно
@@ -452,6 +501,17 @@ fn choose_by_number(
 
 /// То же, но можно выбрать несколько — или ни одного.
 pub fn choose_many(caps: &Caps, title: &str, items: &[Choice]) -> Result<Vec<usize>, String> {
+    if interactive() {
+        return match pick_many(caps, title, items)? {
+            Some(v) => Ok(v),
+            None => Err("выбор отменён".into()),
+        };
+    }
+    choose_many_by_number(caps, title, items)
+}
+
+/// Запасной путь для пайпа и чужого терминала: те же пункты, но номерами.
+fn choose_many_by_number(caps: &Caps, title: &str, items: &[Choice]) -> Result<Vec<usize>, String> {
     list(caps, title, items);
     loop {
         put(&question(caps, "номера через запятую", "пусто — ни одного"));
@@ -634,5 +694,14 @@ mod tests {
         // У краёв окно упирается, а не свисает.
         assert_eq!(window_start(0, 40, 10), 0);
         assert_eq!(window_start(39, 40, 10), 30);
+    }
+    /// Пробел в списке — отметка, а не буква: без него выбор нескольких
+    /// пришлось бы набирать номерами рядом со списком, который листают.
+    #[test]
+    fn space_marks_a_line() {
+        assert_eq!(
+            pick_act(KeyCode::Char(' '), KeyModifiers::NONE),
+            Some(Pick::Toggle)
+        );
     }
 }
