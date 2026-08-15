@@ -278,6 +278,13 @@ struct Ui {
     help_at: usize,
     /// Когда последний раз нажали Ctrl+C: второй раз подряд закрывает окно.
     break_at: i64,
+    /// Где стоит курсор в списке шага формы и что в нём отмечено.
+    ///
+    /// Список в форме листается стрелками — набирать номера рядом со списком,
+    /// который и так перед глазами, незачем. Номера при этом никуда не делись:
+    /// набранное в строке сильнее выбранного курсором.
+    fsel: usize,
+    fmark: Vec<bool>,
     /// До какого момента держим приветствие. Оно сказано один раз и не должно
     /// навсегда занимать строку, где живут лимиты.
     greet_until: i64,
@@ -342,6 +349,8 @@ impl Default for Ui {
             help_at: 0,
             tab_cycle: None,
             break_at: 0,
+            fsel: 0,
+            fmark: Vec::new(),
             greet_until: 0,
             feed: None,
             items: Vec::new(),
@@ -1027,6 +1036,27 @@ async fn handle(
         // Справку читают сверху вниз — у неё своя прокрутка, считаемая от
         // начала. У ленты она считается от конца, и общая арифметика тут
         // означала бы, что справка открывается на последней строке.
+        // Список шага формы листается стрелками, а пробел отмечает — как в
+        // мастере снаружи. Номера остаются: набранное сильнее выбранного.
+        Act::Up if ui.typing == Typing::Field && form_slot(ui).is_some() => {
+            ui.fsel = ui.fsel.saturating_sub(1);
+        }
+        Act::Down if ui.typing == Typing::Field && form_slot(ui).is_some() => {
+            let n = form_slot(ui)
+                .map(|s| crate::engine::builder::catalog(s).len())
+                .unwrap_or(0);
+            ui.fsel = (ui.fsel + 1).min(n.saturating_sub(1));
+        }
+        Act::Type(' ')
+            if ui.typing == Typing::Field
+                && form_slot(ui) == Some(crate::engine::presets::Slot::Gate) =>
+        {
+            let n = crate::engine::builder::catalog(crate::engine::presets::Slot::Gate).len();
+            ui.fmark.resize(n, false);
+            if let Some(m) = ui.fmark.get_mut(ui.fsel) {
+                *m = !*m;
+            }
+        }
         Act::Up if ui.view == View::Help => ui.help_at = ui.help_at.saturating_sub(1),
         Act::Down if ui.view == View::Help => ui.help_at += 1,
         Act::PageUp if ui.view == View::Help => ui.help_at = ui.help_at.saturating_sub(10),
@@ -1249,12 +1279,32 @@ async fn handle(
         // к прошлому вопросу человеку надо чаще, чем отменять всю форму.
         Act::Backspace if ui.typing == Typing::Field && ui.input.is_empty() => {
             if let Some(was) = ui.form.as_mut().and_then(Form::back) {
+                ui.fsel = 0;
+                ui.fmark.clear();
                 ui.input.set(was);
                 ui.status = "вернулся к прошлому вопросу".into();
             }
         }
         Act::Send if ui.typing == Typing::Field => {
-            let answer = ui.input.text().to_string();
+            let mut answer = ui.input.text().to_string();
+            // Пустая строка на шаге со списком означает «то, что под курсором»
+            // (а для гейтов — всё отмеченное). Форме по-прежнему уходят
+            // номера: она про списки ничего не знает и знать не должна.
+            if answer.trim().is_empty() {
+                if let Some(slot) = form_slot(ui) {
+                    answer = if slot == crate::engine::presets::Slot::Gate {
+                        ui.fmark
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, m)| **m)
+                            .map(|(i, _)| (i + 1).to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    } else {
+                        (ui.fsel + 1).to_string()
+                    };
+                }
+            }
             let Some(form) = ui.form.as_mut() else {
                 ui.typing = Typing::None;
                 return true;
@@ -1263,6 +1313,8 @@ async fn handle(
                 // Либо следующий вопрос, либо тот же — когда ответ не понят.
                 ui.input.clear();
                 ui.status.clear();
+                ui.fsel = 0;
+                ui.fmark.clear();
                 return true;
             }
             let form = ui.form.take().unwrap();
@@ -2210,6 +2262,15 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
     out
 }
 
+/// Какой каталог показывает нынешний шаг формы: гейты, источники или ничего.
+fn form_slot(ui: &Ui) -> Option<crate::engine::presets::Slot> {
+    match ui.form.as_ref()?.step() {
+        crate::ui::form::Step::Gates => Some(crate::engine::presets::Slot::Gate),
+        crate::ui::form::Step::Source => Some(crate::engine::presets::Slot::Source),
+        _ => None,
+    }
+}
+
 /// Что сейчас отбираем. Пусто — показываем всё.
 fn filter_of(ui: &Ui) -> String {
     if ui.typing == Typing::Filter {
@@ -2370,6 +2431,26 @@ fn keys_hint(caps: &Caps, ui: &Ui) -> String {
         // Набор идёт поверх любого вида, поэтому его подсказки — первыми.
         _ if ui.typing == Typing::Filter => {
             vec![("набирай", "отбор"), ("↵", "оставить"), ("esc", "снять")]
+        }
+        // На шаге со списком подсказки другие: там ходят стрелками, а гейты
+        // ещё и отмечают пробелом.
+        _ if ui.typing == Typing::Field
+            && form_slot(ui) == Some(crate::engine::presets::Slot::Gate) =>
+        {
+            vec![
+                ("↑↓", "по списку"),
+                ("␣", "отметить"),
+                ("↵", "дальше"),
+                ("⌫", "назад"),
+            ]
+        }
+        _ if ui.typing == Typing::Field && form_slot(ui).is_some() => {
+            vec![
+                ("↑↓", "по списку"),
+                ("↵", "взять"),
+                ("⌫", "назад"),
+                ("esc", "отменить"),
+            ]
         }
         _ if ui.typing == Typing::Field => {
             vec![("↵", "дальше"), ("⌫", "назад"), ("esc", "отменить")]
@@ -2727,12 +2808,7 @@ fn draw_form(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
         ),
     );
 
-    let slot = match form.step() {
-        crate::ui::form::Step::Gates => Some(crate::engine::presets::Slot::Gate),
-        crate::ui::form::Step::Source => Some(crate::engine::presets::Slot::Source),
-        _ => None,
-    };
-    if let Some(slot) = slot {
+    if let Some(slot) = form_slot(ui) {
         push(out, "");
         let cat = crate::engine::builder::catalog(slot);
         let col = cat
@@ -2745,21 +2821,39 @@ fn draw_form(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
         // Влезет столько, сколько осталось места: остальное человек и так
         // наберёт номерами, а обрезанный список честнее вранья про «это всё».
         let room = rows.saturating_sub(form.filled().len() + 6).max(3);
-        for (i, p) in cat.iter().enumerate().take(room) {
+        // Окно едет за курсором: выбранное обязано быть на виду, иначе стрелки
+        // двигают невидимое.
+        let from = crate::ui::prompt::window_start(ui.fsel, cat.len(), room);
+        let multi = slot == crate::engine::presets::Slot::Gate;
+        for (i, p) in cat.iter().enumerate().skip(from).take(room) {
             if p.category != group {
                 group = p.category;
                 push(out, &format!("  {}", paint(caps, Role::Dim, group)));
             }
+            let here = i == ui.fsel;
+            let mark = if here { "▸" } else { " " };
+            let box_ = if !multi {
+                String::new()
+            } else if ui.fmark.get(i).copied().unwrap_or(false) {
+                format!("{} ", paint(caps, Role::Ok, "[×]"))
+            } else {
+                format!("{} ", paint(caps, Role::Dim, "[ ]"))
+            };
+            let name = if here {
+                paint(caps, Role::Accent, &truncate(p.name, col))
+            } else {
+                paint(caps, Role::Text, &truncate(p.name, col))
+            };
             push(
                 out,
                 &format!(
-                    "  {}  {}  {}",
-                    paint(caps, Role::Accent, &format!("{:>2}", i + 1)),
-                    pad(&truncate(p.name, col), col),
+                    " {mark} {} {box_}{}  {}",
+                    paint(caps, Role::Dim, &format!("{:>2}", i + 1)),
+                    pad(&name, col),
                     paint(
                         caps,
                         Role::Muted,
-                        &truncate(p.hint, total.saturating_sub(col + 12))
+                        &truncate(p.hint, total.saturating_sub(col + 14))
                     )
                 ),
             );
@@ -2767,7 +2861,11 @@ fn draw_form(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
         if cat.len() > room {
             push(
                 out,
-                &paint(caps, Role::Dim, &format!("  … и ещё {}", cat.len() - room)),
+                &paint(
+                    caps,
+                    Role::Dim,
+                    &format!("     {}/{}", ui.fsel + 1, cat.len()),
+                ),
             );
         }
     }
@@ -3827,5 +3925,40 @@ mod tests {
             std::hint::black_box(f);
         }
         println!("кадр: {:?} на штуку", t0.elapsed() / 100);
+    }
+    /// Список в форме листается стрелками, а пустой Enter берёт то, что под
+    /// курсором: набирать номера рядом со списком, который и так перед
+    /// глазами, незачем. Набранное при этом сильнее выбранного.
+    #[tokio::test]
+    async fn the_form_list_walks_by_arrows() {
+        let mut ui = ui_in(View::Loops, Typing::None);
+        press(&mut ui, Act::NewHand).await;
+        for answer in ["/srv/проект", "имя", "цель"] {
+            ui.input.set(answer);
+            press(&mut ui, Act::Send).await;
+        }
+        assert_eq!(
+            ui.form.as_ref().map(|f| f.step()),
+            Some(crate::ui::form::Step::Source)
+        );
+        // Вниз — и пустой Enter берёт вторую заготовку источника.
+        press(&mut ui, Act::Down).await;
+        assert_eq!(ui.fsel, 1);
+        press(&mut ui, Act::Send).await;
+        let cat = crate::engine::builder::catalog(crate::engine::presets::Slot::Source);
+        assert_eq!(
+            ui.form.as_ref().map(|f| f.command.clone()),
+            Some(cat[1].command.to_string()),
+            "взялась не та заготовка"
+        );
+        // Гейты: пробел отмечает, Enter собирает отмеченное.
+        assert_eq!(ui.fsel, 0, "курсор не вернулся в начало нового списка");
+        press(&mut ui, Act::Type(' ')).await;
+        press(&mut ui, Act::Down).await;
+        press(&mut ui, Act::Type(' ')).await;
+        let gates = crate::engine::builder::catalog(crate::engine::presets::Slot::Gate);
+        press(&mut ui, Act::Send).await;
+        assert!(ui.form.is_none(), "форма не закончилась");
+        assert!(gates.len() > 2, "каталог гейтов пуст — тест ни о чём");
     }
 }

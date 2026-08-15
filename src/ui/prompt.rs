@@ -241,7 +241,7 @@ fn pick_act(code: KeyCode, mods: KeyModifiers) -> Option<Pick> {
 /// Держим выбранное в середине, как SelectList в pi: прижатый к краю выбор не
 /// даёт увидеть, что идёт следом. У краёв списка окно упирается — сверху в
 /// начало, снизу в конец, иначе под списком висел бы пустой хвост.
-fn window_start(pos: usize, len: usize, room: usize) -> usize {
+pub fn window_start(pos: usize, len: usize, room: usize) -> usize {
     if len <= room {
         return 0;
     }
