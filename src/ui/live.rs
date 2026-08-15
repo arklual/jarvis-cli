@@ -26,7 +26,7 @@ use crate::ui::editor::Editor;
 use crate::ui::form::{Form, Kind};
 use crate::ui::render::{self, Window};
 use crate::ui::slash;
-use crate::ui::style::{band, header, key, pad, paint, truncate, width, Bg, Caps, Role};
+use crate::ui::style::{band, header, key, pad, paint, truncate, width, wrap, Bg, Caps, Role};
 use crossterm::event::{poll, read, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::io::Write;
 use std::time::Duration;
@@ -2838,14 +2838,12 @@ fn draw_bundles(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
 fn draw_form(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
     let Some(form) = ui.form.as_ref() else { return };
     let total = caps.width as usize;
-    push(
-        out,
-        &paint(
-            caps,
-            Role::Muted,
-            " Несколько вопросов. Enter — согласиться с тем, что в скобках.",
-        ),
-    );
+    for line in wrap(
+        " Несколько вопросов. Enter — согласиться с тем, что в скобках.",
+        total,
+    ) {
+        push(out, &paint(caps, Role::Muted, &line));
+    }
     push(out, "");
     for (label, value) in form.filled() {
         push(
@@ -2864,12 +2862,19 @@ fn draw_form(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
 
     let (question, default) = form.question();
     push(out, "");
+    // Умолчание режем по остатку строки, а не по сорока знакам: длинный путь
+    // иначе уносил вопрос за край экрана.
+    let room = total.saturating_sub(width(question) + 6);
     push(
         out,
         &format!(
             " {} {}",
             paint(caps, Role::Accent, &format!("{question}?")),
-            paint(caps, Role::Dim, &format!("[{}]", truncate(&default, 40)))
+            paint(
+                caps,
+                Role::Dim,
+                &format!("[{}]", truncate(&default, room.clamp(8, 40)))
+            )
         ),
     );
 
@@ -4180,6 +4185,21 @@ mod tests {
                         assert!(
                             width_of(line) <= width as usize,
                             "{view:?} при ширине {width}: строка шире экрана ({}): {line:?}",
+                            width_of(line)
+                        );
+                    }
+                    // Форма поверх того же вида: у неё свой каталог заготовок с
+                    // длинными подсказками.
+                    let mut with_form = ui_in(view.clone(), Typing::Field);
+                    with_form.form = Some(crate::ui::form::Form::new_loop(
+                        "/srv/очень/длинный/путь/до/проекта",
+                    ));
+                    with_form.input.set("что-то набранное");
+                    let f = frame(&caps, "local", &with_form, &sessions(6), 24);
+                    for line in f.split("\r\n") {
+                        assert!(
+                            width_of(line) <= width as usize,
+                            "форма при ширине {width}: строка шире экрана ({}): {line:?}",
                             width_of(line)
                         );
                     }
