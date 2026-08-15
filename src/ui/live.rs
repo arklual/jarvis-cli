@@ -3791,4 +3791,41 @@ mod tests {
         press(&mut ui, Act::Backspace).await;
         assert!(ui.form.is_some());
     }
+    /// Сколько стоит кадр. Не проверка, а линейка: запускается вручную
+    /// (`cargo test --release measure_frame_cost -- --ignored --nocapture`),
+    /// потому что порог во времени в CI — источник ложных падений.
+    ///
+    /// Замер на шестидесяти записях ленты с разметкой, таблицей и блоком кода:
+    /// 1,6 мс в release (15 мс в debug). При двенадцати кадрах в секунду это
+    /// около двух процентов ядра — столько разбор разметки и стоит.
+    #[test]
+    #[ignore]
+    fn measure_frame_cost() {
+        let mut ui = ui_in(View::Chat, Typing::None);
+        let text = "Разобрал **как есть**: `src/ui/live.rs` рисует кадр целиком.\n\n- первое\n- второе\n\n```rust\nfn main() {}\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        ui.items = (0..60)
+            .map(|i| crate::ui::chat::Item {
+                kind: if i % 3 == 0 {
+                    crate::ui::chat::Kind::Tool
+                } else {
+                    crate::ui::chat::Kind::Agent
+                },
+                text: text.to_string(),
+                detail: "Bash".into(),
+            })
+            .collect();
+        let caps = Caps {
+            color: true,
+            theme: crate::ui::style::Theme::Dark,
+            truecolor: true,
+            unicode: true,
+            width: 100,
+        };
+        let t0 = std::time::Instant::now();
+        for _ in 0..100 {
+            let f = frame(&caps, "local", &ui, &[], 40);
+            std::hint::black_box(f);
+        }
+        println!("кадр: {:?} на штуку", t0.elapsed() / 100);
+    }
 }
