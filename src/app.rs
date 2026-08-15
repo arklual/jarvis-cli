@@ -69,22 +69,30 @@ pub async fn registry(client: &NodeClient) -> Result<HashMap<String, Session>, S
 /// Найти сессию по началу id или по имени проекта.
 ///
 /// Однозначность обязательна: молча взять первую подходящую значит однажды
-/// отправить ответ не тому агенту.
+/// отправить ответ не тому агенту. Поэтому сперва точные совпадения, и только
+/// если их нет — начала: «api» при живых «api» и «api-gateway» это «api», а не
+/// повод переспрашивать.
+///
+/// Начало имени проекта считается за совпадение: палитра в окне показывает
+/// «lct», пока набирают «lc», и отказ «не нашёл сессию lc» после этого выглядит
+/// издевательством.
 pub fn resolve<'a>(list: &'a [Session], needle: &str) -> Result<&'a Session, String> {
     let n = needle.trim().to_lowercase();
     if n.is_empty() {
         return Err("не назвал сессию".into());
     }
-    let hits: Vec<&Session> = list
+    let name_of = |s: &Session| s.project.as_deref().unwrap_or_default().to_lowercase();
+    let exact: Vec<&Session> = list
         .iter()
-        .filter(|s| {
-            s.id.to_lowercase().starts_with(&n)
-                || s.project
-                    .as_deref()
-                    .map(|p| p.to_lowercase() == n)
-                    .unwrap_or(false)
-        })
+        .filter(|s| s.id.to_lowercase() == n || name_of(s) == n)
         .collect();
+    let hits: Vec<&Session> = if exact.is_empty() {
+        list.iter()
+            .filter(|s| s.id.to_lowercase().starts_with(&n) || name_of(s).starts_with(&n))
+            .collect()
+    } else {
+        exact
+    };
     match hits.len() {
         1 => Ok(hits[0]),
         0 => Err(format!("не нашёл сессию «{needle}»")),
@@ -1061,6 +1069,22 @@ mod tests {
             "abc123",
             "регистр не важен"
         );
+    }
+
+    /// Начало имени проекта — тоже совпадение: палитра показывает «lct», пока
+    /// набирают «lc», и отказ после этого выглядит издевательством. Но точное
+    /// имя сильнее чужого начала.
+    #[test]
+    fn a_project_name_matches_by_its_beginning_too() {
+        let list = vec![sess("abc123", "jarvis"), sess("def456", "lct")];
+        assert_eq!(resolve(&list, "lc").unwrap().id, "def456");
+        assert_eq!(resolve(&list, "jar").unwrap().id, "abc123");
+        // «api» при живых «api» и «api-gateway» — это «api», а не повод
+        // переспрашивать.
+        let two = vec![sess("a1", "api"), sess("a2", "api-gateway")];
+        assert_eq!(resolve(&two, "api").unwrap().id, "a1");
+        // А неоднозначное начало по-прежнему отказ.
+        assert!(resolve(&two, "ap").is_err());
     }
 
     /// Молча взять первую подходящую — однажды отправить ответ не тому агенту.
