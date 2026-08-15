@@ -3098,12 +3098,14 @@ fn draw_help(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
         push(out, line);
     }
     if clipped {
+        // Подсказка тоже строка кадра: в узком окне её режем, иначе она
+        // перенесётся и утащит за собой весь кадр.
         push(
             out,
             &paint(
                 caps,
                 Role::Muted,
-                " ↑↓ листать · home — в начало · esc — назад",
+                &truncate(" ↑↓ листать · home — в начало · esc — назад", total),
             ),
         );
     }
@@ -4042,6 +4044,94 @@ mod tests {
                     f.split("\r\n").count() <= rows as usize,
                     "{rows} строк, отбор {filter:?}, прокрутка {scroll}: кадр выше экрана ({})",
                     f.split("\r\n").count()
+                );
+            }
+        }
+    }
+    /// Ни одна строка кадра не имеет права быть шире экрана: терминал перенесёт
+    /// её сам, и весь кадр съедет вниз — а следом начнёт прокручиваться.
+    #[test]
+    fn no_frame_line_is_wider_than_the_screen() {
+        let long_url =
+            "https://example.com/очень/длинный/путь/который/никуда/не/влезет?и=ещё&параметры=да";
+        let items = vec![
+            crate::ui::chat::Item {
+                kind: crate::ui::chat::Kind::Agent,
+                text: format!("Смотри {long_url} и `код с очень длинной строкой внутри обратных кавычек`\n\n| колонка раз | колонка два | колонка три |\n|---|---|---|\n| значение подлиннее | ещё значение | и третье |\n\n```rust\nfn очень_длинное_имя_функции(аргумент: СлишкомДлинныйТип) -> Результат {{}}\n```"),
+                detail: String::new(),
+            },
+            crate::ui::chat::Item {
+                kind: crate::ui::chat::Kind::User,
+                text: long_url.to_string(),
+                detail: String::new(),
+            },
+            crate::ui::chat::Item {
+                kind: crate::ui::chat::Kind::Tool,
+                text: "Bash".into(),
+                detail: long_url.to_string(),
+            },
+        ];
+        for width in [40u16, 60, 80, 100, 120] {
+            let caps = Caps {
+                width,
+                ..frame_caps()
+            };
+            let colored = Caps {
+                color: true,
+                truecolor: true,
+                ..caps
+            };
+            for caps in [caps, colored] {
+                for view in [View::Chat, View::List, View::Help] {
+                    let mut ui = ui_in(view.clone(), Typing::None);
+                    ui.items = items.clone();
+                    let f = frame(&caps, "local", &ui, &sessions(6), 24);
+                    for line in f.split("\r\n") {
+                        assert!(
+                            width_of(line) <= width as usize,
+                            "{view:?} при ширине {width}: строка шире экрана ({}): {line:?}",
+                            width_of(line)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn width_of(s: &str) -> usize {
+        crate::ui::style::width(s)
+    }
+    /// Ни одна строка кадра не оставляет краску открытой: незакрытый цвет
+    /// течёт на следующую строку, и подложка соседа приезжает чужим тоном.
+    #[test]
+    fn no_frame_line_leaks_its_colour() {
+        let caps = Caps {
+            color: true,
+            truecolor: true,
+            width: 70,
+            ..frame_caps()
+        };
+        let mut ui = ui_in(View::Chat, Typing::Message);
+        ui.items = vec![
+            crate::ui::chat::Item {
+                kind: crate::ui::chat::Kind::Agent,
+                text: "**жирное начало** и `код` и [ссылка](https://пример.рф) и очень длинная строка, которая обязательно перенесётся по словам\n\n| раз | два |\n|---|---|\n| три | четыре |".into(),
+                detail: String::new(),
+            },
+            crate::ui::chat::Item {
+                kind: crate::ui::chat::Kind::User,
+                text: "вопрос человека, тоже достаточно длинный, чтобы перенестись".into(),
+                detail: String::new(),
+            },
+        ];
+        ui.input.set("набранное");
+        for view in [View::Chat, View::List, View::Help] {
+            ui.view = view.clone();
+            let f = frame(&caps, "local", &ui, &sessions(4), 24);
+            for line in f.split("\r\n") {
+                assert!(
+                    crate::ui::style::open_colour(line).is_empty(),
+                    "{view:?}: краска утекла со строки {line:?}"
                 );
             }
         }
