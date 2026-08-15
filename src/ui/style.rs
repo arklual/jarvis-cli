@@ -312,9 +312,10 @@ pub fn accent(caps: &Caps, role: Role, attrs: &[u8], text: &str) -> String {
         return text.to_string();
     }
     let mut codes: Vec<String> = attrs.iter().map(|a| a.to_string()).collect();
-    if let Role::Plain = role {
-    } else if let Some(c) = rgb(caps.theme, role) {
-        codes.push(sgr(caps, c, false));
+    if !matches!(role, Role::Plain) {
+        if let Some(c) = rgb(caps.theme, role) {
+            codes.push(sgr(caps, c, false));
+        }
     }
     if codes.is_empty() {
         return text.to_string();
@@ -780,14 +781,23 @@ pub fn chop(s: &str, room: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = s.to_string();
     while width(&rest) > room {
-        let head = take_width(&rest, room);
+        let mut head = take_width(&rest, room);
         if head.is_empty() {
-            break;
+            // Ширина в одну ячейку, а впереди двухклеточный знак: откусываем
+            // его целиком, иначе цикл не сдвинется с места.
+            let Some((_, first)) = clusters(&rest).next() else {
+                break;
+            };
+            head = first.to_string();
         }
         rest = rest[head.len()..].to_string();
         out.push(head);
     }
-    out.push(rest);
+    // Пустой хвост не строка: у строки ровно в ширину окна он добавил бы под
+    // ней пустую полосу.
+    if !rest.is_empty() || out.is_empty() {
+        out.push(rest);
+    }
     out
 }
 
@@ -1326,5 +1336,13 @@ mod tests {
         }
         let joined: String = wrap(&format!("сокет: {path}"), 20).join("");
         assert!(joined.contains("node.sock"), "потеряли хвост: {joined}");
+    }
+    /// Резать надо и там, где ячейка одна, а знак широкий: иначе цикл стоит на
+    /// месте, а строка уезжает за край.
+    #[test]
+    fn chopping_moves_even_on_wide_characters() {
+        assert_eq!(chop("日本語", 1).len(), 3);
+        assert_eq!(chop("абвгд", 2), vec!["аб", "вг", "д"]);
+        assert_eq!(chop("коротко", 20), vec!["коротко"]);
     }
 }
