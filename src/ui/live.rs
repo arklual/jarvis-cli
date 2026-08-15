@@ -1398,6 +1398,9 @@ async fn handle(
             match slash::parse(&line) {
                 slash::Line::Cmd { name, rest } => {
                     ui.input.clear();
+                    // Сокращение разворачиваем в то, что показывала палитра:
+                    // «/lim» и «/limits» — одна и та же команда.
+                    let name = slash::resolve(&name).map(str::to_string).unwrap_or(name);
                     let alive = run_slash(ui, &name, &rest, client, list, caps, tx).await;
                     ui.typing = idle_typing(ui);
                     return alive;

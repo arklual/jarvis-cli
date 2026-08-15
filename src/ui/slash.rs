@@ -72,6 +72,26 @@ pub fn parse(input: &str) -> Line {
     Line::Cmd { name, rest }
 }
 
+/// Полное имя команды по сокращению: `lim` → `limits`.
+///
+/// Только по началу имени и только когда подходит ровно одна: палитра под
+/// строкой показывает «/limits», и Enter обязан выполнить именно то, что она
+/// показывает, — раньше «/lim» уходило агенту как непонятная команда.
+/// Похожесть для этого не годится: `/clear` агента не должен превращаться в
+/// чужую команду окна.
+pub fn resolve(name: &str) -> Option<&'static str> {
+    let p = name.trim_start_matches('/').to_lowercase();
+    if p.is_empty() {
+        return None;
+    }
+    if let Some(c) = all().iter().find(|c| c.name == p) {
+        return Some(c.name);
+    }
+    let mut starts = all().iter().filter(|c| c.name.starts_with(&p));
+    let first = starts.next()?;
+    starts.next().is_none().then_some(first.name)
+}
+
 /// Насколько запрос похож на слово. Меньше — лучше; `None` — не подходит.
 ///
 /// Правила те же, что у pi: буквы запроса должны идти по порядку, но не
@@ -375,5 +395,19 @@ mod tests {
         for c in all() {
             assert!(!c.what.is_empty(), "{} без объяснения", c.name);
         }
+    }
+    /// Сокращение имени команды разворачивается, пока оно однозначно, — и
+    /// только по началу: команды агента через окно не проходят.
+    #[test]
+    fn an_abbreviation_becomes_the_command_it_shows() {
+        assert_eq!(resolve("lim"), Some("limits"));
+        assert_eq!(resolve("limits"), Some("limits"));
+        assert_eq!(resolve("/lo"), Some("loops"));
+        // Неоднозначное не угадываем: «r» — это и run, и rm.
+        assert_eq!(resolve("r"), None);
+        // Команда агента остаётся командой агента.
+        assert_eq!(resolve("compact"), None);
+        assert_eq!(resolve("clear"), None);
+        assert_eq!(resolve(""), None);
     }
 }
