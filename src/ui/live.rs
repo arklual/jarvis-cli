@@ -278,6 +278,13 @@ struct Ui {
     help_at: usize,
     /// Когда последний раз нажали Ctrl+C: второй раз подряд закрывает окно.
     break_at: i64,
+    /// Подсказки к упоминанию файла и то, для чего они посчитаны.
+    ///
+    /// Считаются при изменении строки, а не в кадре: кадр рисуется двенадцать
+    /// раз в секунду, и читать каталог на каждый — это дюжина обходов диска в
+    /// секунду ради списка, который меняется по нажатию клавиши.
+    mentions: Vec<String>,
+    mention_key: String,
     /// Где стоит курсор в списке шага формы и что в нём отмечено.
     ///
     /// Список в форме листается стрелками — набирать номера рядом со списком,
@@ -349,6 +356,8 @@ impl Default for Ui {
             help_at: 0,
             tab_cycle: None,
             break_at: 0,
+            mentions: Vec::new(),
+            mention_key: String::new(),
             fsel: 0,
             fmark: Vec::new(),
             greet_until: 0,
@@ -1723,7 +1732,40 @@ async fn handle(
         }
         Act::None => {}
     }
+    refresh_mentions(ui, list);
     true
+}
+
+/// Пересчитать подсказки к упоминанию файла — если строка изменилась.
+///
+/// Читать каталог в кадре нельзя: кадр рисуется двенадцать раз в секунду, а
+/// строка меняется по нажатию. Ключ хранит, для чего список посчитан, — и
+/// повторный обход диска не случается вовсе.
+fn refresh_mentions(ui: &mut Ui, list: &[Session]) {
+    let want = if typing_now(ui) && ui.typing != Typing::Command {
+        at_mention(ui.input.text(), ui.input.cursor()).map(|(at, part)| {
+            // Пока идёт круг дополнений, список считаем по НАБРАННОМУ, а не по
+            // подставленному: иначе он схлопывается в один пункт.
+            match &ui.tab_cycle {
+                Some((was, typed, _)) if *was == at => (at, typed.clone()),
+                _ => (at, part),
+            }
+        })
+    } else {
+        None
+    };
+    let key = want
+        .as_ref()
+        .map(|(at, typed)| format!("{at}\0{typed}"))
+        .unwrap_or_default();
+    if key == ui.mention_key {
+        return;
+    }
+    ui.mention_key = key;
+    ui.mentions = match &want {
+        Some((_, typed)) => file_candidates(&mention_base(ui, list), typed),
+        None => Vec::new(),
+    };
 }
 
 /// Та же клавиша, но вызванная командой. Через `Box::pin`, потому что команда
@@ -2172,23 +2214,14 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
     // «какие вообще бывают» человек спрашивает один раз, а «что подставить
     // сюда» — каждый раз.
     // Упоминание файла набирают чаще, чем команду, — его список идёт первым.
-    let (mentions, at_cycle) = if typing_now(ui) && ui.typing != Typing::Command {
-        match at_mention(ui.input.text(), ui.input.cursor()) {
-            Some((at, part)) => {
-                // Пока идёт круг дополнений, список считаем по НАБРАННОМУ, а не
-                // по подставленному: иначе он схлопывается в один пункт и
-                // человек не видит, между чем ходит.
-                let (typed, at_cycle) = match &ui.tab_cycle {
-                    Some((was, typed, i)) if *was == at => (typed.clone(), Some(*i)),
-                    _ => (part, None),
-                };
-                (file_candidates(&mention_base(ui, list), &typed), at_cycle)
-            }
-            None => (Vec::new(), None),
-        }
-    } else {
-        (Vec::new(), None)
-    };
+    // Сами подсказки посчитаны при вводе (см. refresh_mentions), кадр только
+    // печатает их.
+    let mentions = &ui.mentions;
+    let at_cycle =
+        at_mention(ui.input.text(), ui.input.cursor()).and_then(|(at, _)| match &ui.tab_cycle {
+            Some((was, _, i)) if *was == at => Some(*i),
+            _ => None,
+        });
     for (i, c) in mentions.iter().enumerate().take(6) {
         let role = if at_cycle == Some(i) {
             Role::Accent
@@ -3838,6 +3871,9 @@ mod tests {
             ..Default::default()
         };
         ui.input.set("посмотри @sr");
+        // Подсказки считает handle после каждой клавиши — здесь зовём то же
+        // самое напрямую, чтобы не набирать строку по буквам.
+        refresh_mentions(&mut ui, &[]);
         let f = frame(&frame_caps(), "local", &ui, &[], 30);
         assert!(f.contains("src/"), "нет подсказки про src/:\n{f}");
     }
