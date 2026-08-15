@@ -201,9 +201,24 @@ impl NodeClient {
     ///
     /// Мёртвая пана отвечает ошибкой tmux — и это нормальный ответ: значит
     /// закрывать было нечего, а сессию всё равно надо забыть.
+    /// Узел старой версии про `/kill` не знает, а POST на неизвестный путь у
+    /// него означает «конверт от хука»: он молча кладёт тело в буфер и
+    /// отвечает 204. Говорим об этом прямо — сказать «завершил» живому агенту
+    /// в лицо было бы худшим из ответов.
     pub async fn kill(&self, pane: &str) -> Result<(), String> {
-        self.post("/kill", &serde_json::json!({ "pane": pane }))
-            .await
+        let (code, bytes) = self
+            .request(
+                "POST",
+                "/kill",
+                Some(serde_json::json!({ "pane": pane }).to_string().into_bytes()),
+                READ,
+            )
+            .await?;
+        match code {
+            200 => Ok(()),
+            204 => Err("узел не умеет завершать сессии — обнови jarvis-node".into()),
+            _ => Err(http_err(code, &bytes)),
+        }
     }
 
     /// Слэш-команда пульта (`/model`, `/effort`) в пану.
