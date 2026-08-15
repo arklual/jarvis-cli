@@ -1017,8 +1017,9 @@ mod tests {
         let c = caps();
         let line = project_line(&c, "/home/bob/projects/jarvis", 12, 0);
         assert!(line.contains("jarvis") && !line.contains("/home/bob"));
-        assert!(line.contains("12 чат."));
+        assert!(line.contains("12 чатов"), "{line:?}");
     }
+
     /// Поправка прокрутки считается ровно по тем строкам, которые лента и
     /// нарисует: иначе окно уедет на пару строк и человек потеряет место.
     #[test]
