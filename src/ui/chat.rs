@@ -533,11 +533,18 @@ pub fn block(caps: &Caps, it: &Item, total: usize) -> Vec<String> {
                     )),
                     Md::CodeStart(_) => out.push(format!("  {}", paint(caps, Role::Border, "┌"))),
                     Md::CodeEnd => out.push(format!("  {}", paint(caps, Role::Border, "└"))),
-                    Md::Code(t) => out.push(format!(
-                        "  {} {}",
-                        paint(caps, Role::Border, "│"),
-                        paint(caps, Role::Muted, &truncate(&t, room.saturating_sub(2)))
-                    )),
+                    // Код не переносим по словам и не обрезаем: отступы в нём
+                    // значимы, а обрезанная команда — это команда, которую
+                    // нельзя выполнить. Режем ровно по ширине.
+                    Md::Code(t) => {
+                        for part in crate::ui::style::chop(&t, room.saturating_sub(2)) {
+                            out.push(format!(
+                                "  {} {}",
+                                paint(caps, Role::Border, "│"),
+                                paint(caps, Role::Muted, &part)
+                            ));
+                        }
+                    }
                     Md::Quote(t) => {
                         for l in wrap(&inline(caps, &t, Role::Muted), room.saturating_sub(2)) {
                             out.push(format!("  {} {}", paint(caps, Role::Border, "│"), l));
@@ -1113,5 +1120,33 @@ mod tests {
         assert!(many.contains("11 чатов"), "{many:?}");
         let at = |s: &str| s.rfind(':').map(|i| crate::ui::style::width(&s[..i]));
         assert_eq!(at(&one), at(&many), "время съехало: {one:?} / {many:?}");
+    }
+    /// Код показывается целиком: отступы значимы, а обрезанная команда — это
+    /// команда, которую нельзя выполнить.
+    #[test]
+    fn code_is_shown_whole_and_keeps_its_indentation() {
+        let c = caps();
+        let it = Item {
+            kind: Kind::Agent,
+            text:
+                "```sh\n    git rebase --onto main очень-длинная-ветка ещё-длиннее --autostash\n```"
+                    .into(),
+            detail: String::new(),
+        };
+        let lines = block(&c, &it, 40);
+        let code: String = lines
+            .iter()
+            .filter(|l| l.contains('│'))
+            .map(|l| {
+                let tail = l.split_once('│').map(|(_, r)| r).unwrap_or("");
+                tail.strip_prefix(' ').unwrap_or(tail).to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(code.contains("--autostash"), "хвост потерян: {lines:?}");
+        assert!(code.starts_with("    git"), "отступ потерян: {code:?}");
+        for l in &lines {
+            assert!(width(l) <= 40, "строка шире окна: {l:?}");
+        }
     }
 }

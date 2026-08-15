@@ -769,6 +769,28 @@ pub fn highlight(caps: &Caps, line: &str, needle: &str) -> String {
     out
 }
 
+/// Разрезать строку по ширине, ничего не выбрасывая.
+///
+/// Для кода: перенос по словам съедает отступы, а обрезка — хвост команды. И
+/// то и другое врёт про содержимое, а код читают буквально.
+pub fn chop(s: &str, room: usize) -> Vec<String> {
+    if room == 0 {
+        return vec![s.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut rest = s.to_string();
+    while width(&rest) > room {
+        let head = take_width(&rest, room);
+        if head.is_empty() {
+            break;
+        }
+        rest = rest[head.len()..].to_string();
+        out.push(head);
+    }
+    out.push(rest);
+    out
+}
+
 /// Дополнить пробелами до ширины (по видимой длине, не по байтам).
 pub fn pad(s: &str, to: usize) -> String {
     let w = width(s);
