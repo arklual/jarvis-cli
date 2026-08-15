@@ -752,10 +752,13 @@ pub async fn tail(
 /// Строка проекта в списке.
 pub fn project_line(caps: &Caps, cwd: &str, count: u64, last_at: i64) -> String {
     let name = cwd.trim_end_matches('/').rsplit('/').next().unwrap_or(cwd);
+    // Числительное словом, а не «3 чат.»: сокращение с точкой выглядит так,
+    // будто строку писали наспех, — а это единственная строка этой команды.
+    let chats = crate::core::util::plural(count, "чат", "чата", "чатов");
     format!(
         "{}  {}  {}",
         crate::ui::style::pad(&truncate(name, 22), 22),
-        paint(caps, Role::Dim, &format!("{count} чат.")),
+        crate::ui::style::pad(&paint(caps, Role::Dim, &chats), 9),
         paint(caps, Role::Dim, &clock(last_at))
     )
 }
@@ -1095,5 +1098,19 @@ mod tests {
     fn a_pipe_in_a_sentence_is_not_a_table() {
         let md = markdown("ставь | между ними\n| и так |");
         assert!(!md.iter().any(|m| matches!(m, Md::Table(_))), "{md:?}");
+    }
+    /// Числительное согласуется: «1 чат», «3 чата», «5 чатов» — и колонка
+    /// времени от этого не съезжает.
+    #[test]
+    fn projects_count_their_chats_in_words() {
+        let c = caps();
+        let one = project_line(&c, "/srv/проект", 1, 1_700_000_000_000);
+        let few = project_line(&c, "/srv/проект", 3, 1_700_000_000_000);
+        let many = project_line(&c, "/srv/проект", 11, 1_700_000_000_000);
+        assert!(one.contains("1 чат "), "{one:?}");
+        assert!(few.contains("3 чата"), "{few:?}");
+        assert!(many.contains("11 чатов"), "{many:?}");
+        let at = |s: &str| s.rfind(':').map(|i| crate::ui::style::width(&s[..i]));
+        assert_eq!(at(&one), at(&many), "время съехало: {one:?} / {many:?}");
     }
 }
