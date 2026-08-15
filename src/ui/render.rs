@@ -44,7 +44,11 @@ pub fn session_row(caps: &Caps, s: &Session, name_col: usize) -> String {
     let room = (caps.width as usize)
         .saturating_sub(width(&head) + width(&tail))
         .max(10);
-    format!("{head}{}{tail}", truncate(&detail, room))
+    // Время — по правому краю: в списке из десяти строк колонка времени
+    // читается взглядом сверху вниз, а время, приклеенное к концу подробности,
+    // приходится искать в каждой строке заново. Добивка идёт ВНУТРЬ строки,
+    // хвостовых пробелов не появляется.
+    format!("{head}{}{tail}", pad(&truncate(&detail, room), room))
 }
 
 /// Ширина колонки имени: по самому длинному, но в разумных пределах.
@@ -510,5 +514,35 @@ mod tests {
         assert_eq!(name_column(&[]), 10);
         let long = sess(&"я".repeat(80), Status::Idle);
         assert_eq!(name_column(&[long]), 24, "длинное имя не съедает экран");
+    }
+    /// Время стоит по правому краю у всех строк, а не там, где кончилась
+    /// подробность: иначе колонку времени приходится искать в каждой строке.
+    #[test]
+    fn the_clock_keeps_to_the_right_edge() {
+        let c = Caps {
+            color: false,
+            theme: crate::ui::style::Theme::Dark,
+            truecolor: false,
+            unicode: true,
+            width: 60,
+        };
+        let short = Session {
+            id: "a".into(),
+            project: Some("раз".into()),
+            detail: "коротко".into(),
+            updated_at: 1_700_000_000_000,
+            ..Default::default()
+        };
+        let long = Session {
+            id: "b".into(),
+            project: Some("два".into()),
+            detail: "подробность настолько длинная, что её придётся обрезать по ширине".into(),
+            updated_at: 1_700_000_000_000,
+            ..Default::default()
+        };
+        let a = session_row(&c, &short, 8);
+        let b = session_row(&c, &long, 8);
+        assert_eq!(width(&a), width(&b), "{a:?} / {b:?}");
+        assert!(!a.ends_with(' '), "хвостовые пробелы: {a:?}");
     }
 }
