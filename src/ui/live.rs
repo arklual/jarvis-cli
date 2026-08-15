@@ -2102,26 +2102,34 @@ fn frame(caps: &Caps, machine: &str, ui: &Ui, list: &[Session], rows: u16) -> St
         0
     };
     let body = (rows as usize).saturating_sub(5 + input_h);
+    // Тело рисуем отдельно и обрезаем по отведённой высоте. Каждый вид считает
+    // свои строки сам, и ошибка на единицу там не переносит кадр, а затирает
+    // соседнюю строку: у нижней строки экрана «вниз» некуда, и пропадает,
+    // например, поле ввода. Одна общая обрезка делает такой промах безвредным.
+    let mut b = String::new();
     if ui.form.is_some() {
-        draw_form(&mut out, caps, ui, body);
+        draw_form(&mut b, caps, ui, body);
     } else {
         match ui.view {
-            View::List => draw_list(&mut out, caps, ui, list, body),
-            View::Chat => draw_chat(&mut out, caps, ui, body),
+            View::List => draw_list(&mut b, caps, ui, list, body),
+            View::Chat => draw_chat(&mut b, caps, ui, body),
             View::Screen => {
                 for line in ui.screen.lines().take(body) {
                     push(
-                        &mut out,
+                        &mut b,
                         &format!(" {}", truncate(line, total.saturating_sub(1))),
                     );
                 }
             }
-            View::Loops => draw_loops(&mut out, caps, ui, body),
-            View::Loop => draw_loop(&mut out, caps, ui, body),
-            View::Bundles => draw_bundles(&mut out, caps, ui, body),
-            View::Bundle => draw_bundle(&mut out, caps, ui, body),
-            View::Help => draw_help(&mut out, caps, ui, body),
+            View::Loops => draw_loops(&mut b, caps, ui, body),
+            View::Loop => draw_loop(&mut b, caps, ui, body),
+            View::Bundles => draw_bundles(&mut b, caps, ui, body),
+            View::Bundle => draw_bundle(&mut b, caps, ui, body),
+            View::Help => draw_help(&mut b, caps, ui, body),
         }
+    }
+    for line in b.split_terminator("\r\n").take(body) {
+        push(&mut out, line);
     }
 
     push(&mut out, "");
@@ -2618,7 +2626,13 @@ fn draw_chat(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
         );
     }
     let lines = chat::feed_lines(caps, &slice, total);
-    for l in visible(&lines, rows, ui.scroll) {
+    // Строка отбора и строка «прокручено» — тоже строки кадра. Не вычесть их
+    // из высоты значит нарисовать кадр выше экрана: нижняя строка при этом
+    // затирает соседнюю, и пропадает, например, поле ввода.
+    let room = rows
+        .saturating_sub(usize::from(!filter.is_empty()))
+        .saturating_sub(usize::from(ui.scroll > 0));
+    for l in visible(&lines, room, ui.scroll) {
         // Подсвечиваем найденное прямо в строке: без этого видно, что запись
         // подошла, но не видно чем.
         push(out, &crate::ui::style::highlight(caps, l, &filter));
@@ -3960,5 +3974,76 @@ mod tests {
         press(&mut ui, Act::Send).await;
         assert!(ui.form.is_none(), "форма не закончилась");
         assert!(gates.len() > 2, "каталог гейтов пуст — тест ни о чём");
+    }
+    /// Кадр не имеет права быть выше экрана НИ В ОДНОМ состоянии: лишняя
+    /// строка не переносит кадр, а затирает соседнюю — так пропадало поле
+    /// ввода под строкой отбора.
+    #[test]
+    fn the_frame_never_outgrows_the_screen() {
+        let caps = frame_caps();
+        let long: Vec<crate::ui::chat::Item> = (0..40)
+            .map(|i| crate::ui::chat::Item {
+                kind: crate::ui::chat::Kind::Agent,
+                text: format!(
+                    "строка номер {i} про стенд и про память, длинная настолько, чтобы перенестись"
+                ),
+                detail: String::new(),
+            })
+            .collect();
+        // Списки связок и циклов — в тот же обход: там высота считается
+        // руками, и ошибка на единицу так же съедает нижнюю строку.
+        let bundle = crate::core::state::Bundle {
+            name: "проект".into(),
+            dir: "/srv/проект".into(),
+            hands: (0..8)
+                .map(|i| crate::core::state::Hand {
+                    name: format!("рука-{i}"),
+                    task: "длинная задача про очередь слияний и всё остальное".into(),
+                    ..Default::default()
+                })
+                .collect(),
+            events: (0..12)
+                .map(|i| crate::core::state::Event {
+                    at: 1_700_000_000_000 + i,
+                    text: format!("событие {i}: слияние прошло, гейты зелёные"),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for view in [View::Bundles, View::Bundle, View::Loops] {
+            for rows in [10u16, 16, 24, 40] {
+                let mut ui = ui_in(view.clone(), Typing::None);
+                ui.bundles = vec![bundle.clone(); 12];
+                ui.open_bundle = bundle.id.clone();
+                let f = frame(&caps, "local", &ui, &[], rows);
+                assert!(
+                    f.split("\r\n").count() <= rows as usize,
+                    "{view:?} при {rows} строках: кадр выше экрана ({})",
+                    f.split("\r\n").count()
+                );
+            }
+        }
+        for rows in [10u16, 20, 24, 40] {
+            for (filter, scroll, typing) in [
+                (String::new(), 0usize, Typing::None),
+                ("стенд".to_string(), 0, Typing::Filter),
+                ("стенд".to_string(), 5, Typing::Filter),
+                (String::new(), 7, Typing::Message),
+            ] {
+                let mut ui = ui_in(View::Chat, typing);
+                ui.items = long.clone();
+                ui.scroll = scroll;
+                ui.status = "что искать в ленте".into();
+                if !filter.is_empty() {
+                    ui.input.set(filter.clone());
+                }
+                let f = frame(&caps, "local", &ui, &[], rows);
+                assert!(
+                    f.split("\r\n").count() <= rows as usize,
+                    "{rows} строк, отбор {filter:?}, прокрутка {scroll}: кадр выше экрана ({})",
+                    f.split("\r\n").count()
+                );
+            }
+        }
     }
 }
