@@ -25,6 +25,10 @@ pub enum Cmd {
     Stop {
         session: String,
     },
+    /// Завершить сессию целиком: закрыть пану вместе с агентом.
+    Kill {
+        session: String,
+    },
     /// Экран паны сессии — что видно в её терминале.
     Screen {
         session: String,
@@ -157,6 +161,10 @@ pub fn help_rows() -> &'static [Help] {
         Cmd("jarvis reply <id> <текст>", "ответить агенту"),
         Cmd("jarvis answer <id> <n>", "ответить на вопрос вариантом n"),
         Cmd("jarvis stop <id>", "прервать агента"),
+        Cmd(
+            "jarvis kill <id>",
+            "завершить сессию: закрыть пану с агентом",
+        ),
         Cmd("jarvis screen <id>", "показать экран сессии"),
         Cmd("jarvis chat <id> [-f]", "лента чата; -f — следить вживую"),
         Cmd("jarvis projects", "проекты машины"),
@@ -341,6 +349,9 @@ fn parse_cmd(rest: &[String]) -> Result<Cmd, String> {
         }
         "stop" => Ok(Cmd::Stop {
             session: arg(1).ok_or("кого прерываем? jarvis stop <сессия>")?,
+        }),
+        "kill" => Ok(Cmd::Kill {
+            session: arg(1).ok_or("кого завершаем? jarvis kill <сессия>")?,
         }),
         "chat" => Ok(Cmd::Chat {
             session: arg(1).ok_or("чей чат? jarvis chat <сессия> [-f]")?,

@@ -20,7 +20,7 @@ use crate::core::machine;
 use crate::core::node::NodeClient;
 use crate::core::session::{self, Session};
 use crate::core::state;
-use crate::core::util::now_ms;
+use crate::core::util::{now_ms, one_line};
 use crate::ui::chat::{self, Feed, Item};
 use crate::ui::editor::Editor;
 use crate::ui::form::{Form, Kind};
@@ -329,6 +329,12 @@ struct Ui {
     redraw: bool,
     /// Счётчик кадров — им крутится спиннер.
     tick: u64,
+    /// Сессии, которые человек завершил: их надо забыть в реестре.
+    ///
+    /// Реестр собирается из событий узла, и «умершая» сессия из него сама не
+    /// уйдёт — событие о конце от неё как раз и не пришло. Список ведём здесь,
+    /// а вычёркивает цикл: у обработчика клавиш реестра нет.
+    forget: Vec<String>,
     /// Что уже просили убрать: второе нажатие подтверждает.
     ///
     /// Подтверждение клавишей, а не окном с кнопками: промах по «d» не должен
@@ -380,6 +386,7 @@ impl Default for Ui {
             hsel: 0,
             open_bundle: String::new(),
             machine: "local".into(),
+            forget: Vec::new(),
             confirm_rm: None,
             form: None,
             busy: None,
@@ -482,6 +489,13 @@ pub async fn run(app: &App, machine_name: &str) -> Result<(), String> {
 
         // 2. События узла, накопившиеся в канале.
         let mut changed = false;
+        // Завершённое человеком вычёркиваем до разбора событий: иначе строка
+        // доживёт до следующего кадра и будет выглядеть так, будто ничего не
+        // произошло.
+        for id in ui.forget.drain(..) {
+            reg.remove(&id);
+            changed = true;
+        }
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 Msg::Events(evs) => {
@@ -1622,6 +1636,9 @@ async fn handle(
                 return true;
             };
             if ui.confirm_rm.as_deref() != Some(b.id.as_str()) {
+                // Первое нажатие спрашивает, второе делает: промах по клавише
+                // не должен стирать связку, а модальное окно ради одного
+                // вопроса — лишнее.
                 let live = crate::engine::bundle::alive(&b).len();
                 ui.confirm_rm = Some(b.id.clone());
                 ui.status = if live > 0 {
@@ -1654,54 +1671,42 @@ async fn handle(
                 Err(e) => ui.status = e,
             }
         }
-        Act::Remove if matches!(ui.view, View::Bundles | View::Bundle) => {
-            let b = if ui.view == View::Bundle {
-                current_bundle(ui).cloned()
-            } else {
-                ui.bundles.get(ui.bsel).cloned()
-            };
-            let Some(b) = b else {
-                ui.status = "нечего убирать".into();
+        // Завершить сессию: закрыть пану вместе с агентом. Второе нажатие
+        // подтверждает — как у связки.
+        //
+        // Нужно для двух случаев сразу: «хватит» живой сессии и «эта давно
+        // мертва, а в списке висит». Мёртвая пана отвечает ошибкой tmux — это
+        // тоже ответ, и строку мы всё равно убираем: держать её дальше не за
+        // чем.
+        Act::Remove if ui.view == View::List => {
+            let Some(s) = cur.clone() else {
+                ui.status = "нечего завершать".into();
                 return true;
             };
-            if ui.confirm_rm.as_deref() != Some(b.id.as_str()) {
-                // Первое нажатие спрашивает, второе делает: промах по клавише
-                // не должен стирать связку, а модальное окно ради одного
-                // вопроса — лишнее.
-                let live = crate::engine::bundle::alive(&b).len();
-                ui.confirm_rm = Some(b.id.clone());
-                ui.status = if live > 0 {
-                    format!(
-                        "«{}»: {} ещё в работе. Убрать вместе с ними? d — да, esc — нет",
-                        b.name,
-                        crate::core::util::plural(live as u64, "рука", "руки", "рук")
-                    )
-                } else {
-                    format!("убрать «{}»? d — да, esc — нет", b.name)
-                };
+            if ui.confirm_rm.as_deref() != Some(s.id.as_str()) {
+                ui.confirm_rm = Some(s.id.clone());
+                ui.status = format!("завершить «{}»? d — да, esc — нет", s.title());
                 return true;
             }
             ui.confirm_rm = None;
-            // Worktree и ветки не трогаем: в окне нет ни флага `--clean`, ни
-            // места прочитать отказ git по каждой руке.
-            let all = state::load_bundles();
-            let Some(i) = all.iter().position(|x| x.id == b.id) else {
-                ui.status = "связка уже убрана".into();
+            let Some(pane) = s.pane.clone().filter(|p| !p.is_empty()) else {
+                // Сессия без паны: закрывать нечего, но и висеть ей незачем —
+                // забываем. Вернётся живая — вернётся и строка, первым же
+                // событием узла.
+                ui.forget.push(s.id.clone());
+                ui.status = format!("убрал из списка — {}", s.title());
                 return true;
             };
-            match crate::engine::bundle::remove(all, i, true, false).await {
-                Ok(report) => {
-                    ui.bundles = state::load_bundles();
-                    ui.bsel = ui.bsel.min(ui.bundles.len().saturating_sub(1));
-                    ui.open_bundle.clear();
-                    ui.view = View::Bundles;
-                    ui.status = report.join(" · ");
+            match client.kill(&pane).await {
+                Ok(()) => ui.status = format!("завершил — {}", s.title()),
+                Err(e) => {
+                    ui.status = format!("паны уже не было ({}) — {}", one_line(&e), s.title())
                 }
-                Err(e) => ui.status = e,
             }
+            ui.forget.push(s.id);
         }
         Act::Remove => {
-            ui.status = "убирать можно связку — в её списке (b)".into();
+            ui.status = "убирать можно связку (в списке связок) и сессию (в списке сессий)".into();
         }
         Act::NewHand if ui.view == View::Bundles => start_form(ui, Kind::Bundle).await,
         Act::NewHand if ui.view == View::Loops => start_form(ui, Kind::Loop).await,
@@ -1870,7 +1875,7 @@ async fn run_slash(
         "stop" => return as_key(ui, Act::Interrupt, client, list, caps, tx).await,
         "merge" => return as_key(ui, Act::Merge, client, list, caps, tx).await,
         "pause" => return as_key(ui, Act::Pause, client, list, caps, tx).await,
-        "rm" => return as_key(ui, Act::Remove, client, list, caps, tx).await,
+        "rm" | "kill" => return as_key(ui, Act::Remove, client, list, caps, tx).await,
         "hand" => {
             if ui.view != View::Bundle {
                 ui.status = "рука заводится в пульте связки: /bundles, потом Enter".into();
@@ -3062,7 +3067,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("m", "влить ветку"),
                 ("p", "пауза связки"),
                 ("n", "новая рука"),
-                ("d", "удалить"),
+                ("d", "убрать: сессию, связку или цикл (спросит)"),
                 ("/", "командная строка; Tab — дополнить"),
             ],
         ),
@@ -3342,9 +3347,15 @@ mod tests {
     }
 
     async fn press(ui: &mut Ui, act: Act) -> bool {
+        press_with(ui, act, &[]).await
+    }
+
+    /// То же, но со списком сессий: действия списка (завершить, открыть чат)
+    /// без него разговаривают с пустотой.
+    async fn press_with(ui: &mut Ui, act: Act, list: &[Session]) -> bool {
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         let client = NodeClient::unix("/nonexistent.sock");
-        handle(ui, act, &client, &[], &Caps::default(), &tx).await
+        handle(ui, act, &client, list, &Caps::default(), &tx).await
     }
 
     /// Ctrl+D — это конец ввода, а не «удалить символ»: терминал шлёт его сам,
@@ -4245,5 +4256,28 @@ mod tests {
                 );
             }
         }
+    }
+    /// Завершение сессии спрашивает один раз и делает со второго — как всё
+    /// разрушительное в окне. Первое нажатие ничего не трогает.
+    #[tokio::test]
+    async fn killing_a_session_asks_once_and_forgets_after() {
+        let list = sessions(2);
+        let mut ui = ui_in(View::List, Typing::None);
+        ui.sel = 1;
+        press_with(&mut ui, Act::Remove, &list).await;
+        assert!(ui.forget.is_empty(), "убрали без подтверждения");
+        assert!(
+            ui.status.contains("завершить"),
+            "не спросили: {}",
+            ui.status
+        );
+        press_with(&mut ui, Act::Remove, &list).await;
+        assert_eq!(ui.forget, vec![list[1].id.clone()], "забыли не ту сессию");
+    }
+
+    /// Клавиша та же, что у связок, — и в списке сессий она про сессию.
+    #[test]
+    fn d_is_remove_everywhere() {
+        assert_eq!(map_key(false, key('d')), Act::Remove);
     }
 }
