@@ -2613,7 +2613,12 @@ fn draw_list(out: &mut String, caps: &Caps, ui: &Ui, list: &[Session], rows: usi
         if i == ui.sel {
             push(out, &band(caps, Bg::Sel, &row, total));
         } else {
-            push(out, &format!(" {row}"));
+            // Без подложки строку никто не обрежет за нас, а строка шире
+            // экрана переносится и ломает весь кадр.
+            push(
+                out,
+                &format!(" {}", truncate(&row, total.saturating_sub(1))),
+            );
         }
     }
 }
@@ -2711,7 +2716,12 @@ fn draw_loops(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
         if i == ui.lsel {
             push(out, &band(caps, Bg::Sel, &row, total));
         } else {
-            push(out, &format!(" {row}"));
+            // Без подложки строку никто не обрежет за нас, а строка шире
+            // экрана переносится и ломает весь кадр.
+            push(
+                out,
+                &format!(" {}", truncate(&row, total.saturating_sub(1))),
+            );
         }
     }
 }
@@ -2810,7 +2820,12 @@ fn draw_bundles(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
         if i == ui.bsel {
             push(out, &band(caps, Bg::Sel, &row, total));
         } else {
-            push(out, &format!(" {row}"));
+            // Без подложки строку никто не обрежет за нас, а строка шире
+            // экрана переносится и ломает весь кадр.
+            push(
+                out,
+                &format!(" {}", truncate(&row, total.saturating_sub(1))),
+            );
         }
     }
 }
@@ -2937,15 +2952,18 @@ fn draw_bundle(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
         &paint(
             caps,
             Role::Dim,
-            &format!(
-                " {} → {}{}",
-                b.dir,
-                if b.base.is_empty() { "main" } else { &b.base },
-                if b.machine.is_empty() || b.machine == "local" {
-                    String::new()
-                } else {
-                    format!(" · {}", b.machine)
-                }
+            &truncate(
+                &format!(
+                    " {} → {}{}",
+                    b.dir,
+                    if b.base.is_empty() { "main" } else { &b.base },
+                    if b.machine.is_empty() || b.machine == "local" {
+                        String::new()
+                    } else {
+                        format!(" · {}", b.machine)
+                    }
+                ),
+                total,
             ),
         ),
     );
@@ -2978,7 +2996,12 @@ fn draw_bundle(out: &mut String, caps: &Caps, ui: &Ui, rows: usize) {
             if i == ui.hsel {
                 push(out, &band(caps, Bg::Sel, &row, total));
             } else {
-                push(out, &format!(" {row}"));
+                // Без подложки строку никто не обрежет за нас, а строка шире
+                // экрана переносится и ломает весь кадр.
+                push(
+                    out,
+                    &format!(" {}", truncate(&row, total.saturating_sub(1))),
+                );
             }
         }
     }
@@ -4121,9 +4144,37 @@ mod tests {
                 ..caps
             };
             for caps in [caps, colored] {
-                for view in [View::Chat, View::List, View::Help] {
+                for view in [
+                    View::Chat,
+                    View::List,
+                    View::Help,
+                    View::Loops,
+                    View::Bundles,
+                    View::Bundle,
+                ] {
                     let mut ui = ui_in(view.clone(), Typing::None);
                     ui.items = items.clone();
+                    // Связка с длинными именами, ветками и конфликтом: строки
+                    // этих видов никто не обрезает, кроме самого вида.
+                    let bundle = crate::core::state::Bundle {
+                        id: "b1".into(),
+                        name: "очень-длинное-имя-связки-которое-никуда-не-влезет".into(),
+                        dir: "/srv/очень/длинный/путь/до/проекта".into(),
+                        hands: vec![crate::core::state::Hand {
+                            id: "h1".into(),
+                            name: "рука-с-длинным-именем".into(),
+                            branch: "team/рука-с-длинным-именем-и-ещё-хвостом".into(),
+                            state: crate::core::state::HandState::Conflict,
+                            conflict_files: vec![
+                                "src/очень/длинный/путь/файл.rs".into(),
+                                "src/ещё/один/файл.rs".into(),
+                            ],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    };
+                    ui.bundles = vec![bundle.clone()];
+                    ui.open_bundle = bundle.id.clone();
                     let f = frame(&caps, "local", &ui, &sessions(6), 24);
                     for line in f.split("\r\n") {
                         assert!(
