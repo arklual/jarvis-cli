@@ -137,6 +137,7 @@ pub async fn run(parsed: Parsed) -> Result<(), String> {
         Cmd::Stop { session } => {
             cmd_key(&app, &parsed.machine, &session, "Escape", "прервал").await
         }
+        Cmd::Kill { session } => cmd_kill(&app, &parsed.machine, &session).await,
         Cmd::Screen { session } => cmd_screen(&app, &parsed.machine, &session).await,
         Cmd::Chat { session, follow } => cmd_chat(&app, &parsed.machine, &session, follow).await,
         Cmd::Projects => cmd_projects(&app, &parsed.machine).await,
@@ -250,6 +251,27 @@ async fn cmd_key(
         .keys(pane_of(s)?, crate::core::node::key_plan(key))
         .await?;
     app.dim(&format!("{word} — {}", s.title()));
+    Ok(())
+}
+
+/// Завершить сессию: закрыть пану вместе с агентом.
+///
+/// Не то же, что `stop`: тот шлёт агенту Escape и прерывает ход, а сессия
+/// остаётся. Здесь сессии не станет. Нужно ровно для двух случаев — «хватит»
+/// и «эта сессия давно мертва, а в списке висит»: у мёртвой паны узел ответит
+/// ошибкой tmux, и это тоже ответ, а не беда.
+async fn cmd_kill(app: &App, machine_name: &str, needle: &str) -> Result<(), String> {
+    let (client, _t) = connect(machine_name).await?;
+    let reg = registry(&client).await?;
+    let list = session::sorted(&reg);
+    let s = resolve(&list, needle)?;
+    let title = s.title();
+    match client.kill(pane_of(s)?).await {
+        Ok(()) => app.dim(&format!("завершил — {title}")),
+        // Паны уже нет — сказать об этом честнее, чем промолчать: список
+        // соберётся заново из событий узла, и мёртвой сессии в нём не будет.
+        Err(e) => app.dim(&format!("паны уже не было ({}) — {title}", one_line(&e))),
+    }
     Ok(())
 }
 

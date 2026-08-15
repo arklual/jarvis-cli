@@ -197,6 +197,15 @@ impl NodeClient {
             .await
     }
 
+    /// Закрыть пану вместе с агентом: конец сессии, а не прерывание хода.
+    ///
+    /// Мёртвая пана отвечает ошибкой tmux — и это нормальный ответ: значит
+    /// закрывать было нечего, а сессию всё равно надо забыть.
+    pub async fn kill(&self, pane: &str) -> Result<(), String> {
+        self.post("/kill", &serde_json::json!({ "pane": pane }))
+            .await
+    }
+
     /// Слэш-команда пульта (`/model`, `/effort`) в пану.
     pub async fn control(&self, pane: &str, cmd: &str) -> Result<(), String> {
         self.post("/control", &serde_json::json!({ "pane": pane, "cmd": cmd }))
